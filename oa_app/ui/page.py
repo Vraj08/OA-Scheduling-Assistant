@@ -8,7 +8,8 @@ from __future__ import annotations
 import re
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -25,10 +26,12 @@ from ..services.approvals import read_requests as read_approval_requests
 from ..services.approvals import set_status as set_approval_status
 from ..services.approvals import submit_request as submit_approval_request
 from ..services.roster import load_roster
+from ..services import callouts_db, pickups_db
 from . import schedule_query, ui_peek
 from . import pickup_scan
 from .recovery import clear_hard_caches, maybe_show_recovery_popup
 from .footer import render_global_footer
+from .vibrant_theme import apply_vibrant_theme
 from .availability import (
     campus_kind,
     clear_caches as clear_availability_caches,
@@ -57,6 +60,115 @@ invalidate_hours_caches = getattr(hours, "invalidate_hours_caches", lambda: None
 
 _META_RE = re.compile(r"\bMETA=(\{.*?\})\s*(?:\||$)", flags=re.I | re.S)
 _MMDD_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
+
+
+def _la_today() -> date:
+    return datetime.now(ZoneInfo("America/Los_Angeles")).date()
+
+
+def _week_bounds_la(ref: date | None = None) -> tuple[date, date]:
+    """Return (monday, sunday) for the LA-local week containing ref."""
+    d = ref or _la_today()
+    monday = d - timedelta(days=d.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
+
+
+_DETAIL_KV_RE = re.compile(r"\b([a-z_]+)\s*=\s*([^|]+)", flags=re.I)
+
+
+def _parse_details_kv(details_rest: str) -> dict[str, str]:
+    """Parse machine-readable key=value tokens from approval details."""
+    out: dict[str, str] = {}
+    for m in _DETAIL_KV_RE.finditer(str(details_rest or "")):
+        k = m.group(1).strip().lower()
+        v = m.group(2).strip()
+        out[k] = v
+    return out
+
+
+def _ensure_la_timestamptz(ts: str) -> str:
+    """Ensure an ISO timestamp string has timezone info (America/Los_Angeles).
+
+    Approvals.created_at may be stored without offset. For Supabase timestamptz,
+    we normalize to LA timezone.
+    """
+    s = str(ts or "").strip()
+    if not s:
+        return datetime.now(ZoneInfo("America/Los_Angeles")).isoformat(timespec="seconds")
+    # If it already has Z / offset, keep it.
+    if re.search(r"(Z|[+-]\d\d:\d\d)$", s):
+        return s
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+        return dt.isoformat(timespec="seconds")
+    except Exception:
+        return datetime.now(ZoneInfo("America/Los_Angeles")).isoformat(timespec="seconds")
+
+
+def _combine_date_time_la(d: date, t) -> datetime:
+    """Combine a date with a time/time-like object into an aware LA datetime."""
+    hh = getattr(t, "hour", 0)
+    mm = getattr(t, "minute", 0)
+    return datetime(d.year, d.month, d.day, int(hh), int(mm), tzinfo=ZoneInfo("America/Los_Angeles"))
+
+
+def _oncall_event_date(sheet_title: str, day_canon: str) -> date | None:
+    """Given an On-Call sheet title and canonical weekday, derive the calendar date."""
+    ws = _oncall_week_start_from_title(sheet_title)
+    if not ws:
+        return None
+    # Find the first date in the 7-day window that matches the requested weekday.
+    want = utils.normalize_day(day_canon)
+    for i in range(7):
+        d = ws + timedelta(days=i)
+        if utils.normalize_day(d.strftime("%A")) == want:
+            return d
+    return None
+
+
+def _oncall_week_start_from_title(sheet_title: str) -> date | None:
+    """Parse 'On Call 1/25 - 1/31' style titles to a LA-local week start date."""
+    s = str(sheet_title or "")
+    m = re.search(r"(\d{1,2})/(\d{1,2})\s*[-–]\s*(\d{1,2})/(\d{1,2})", s)
+    if not m:
+        return None
+    mm = int(m.group(1)); dd = int(m.group(2))
+    today = _la_today()
+    y = today.year
+    cand = date(y, mm, dd)
+    # Year rollover handling.
+    if cand < (today - timedelta(days=183)):
+        cand = date(y + 1, mm, dd)
+    elif cand > (today + timedelta(days=183)):
+        cand = date(y - 1, mm, dd)
+    return cand
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _cached_weekly_supabase_adjustments(user_name: str, week_start: str, week_end: str) -> dict:
+    """Return {callout_hours, pickup_hours} for the given user/week.
+
+    Cached because Supabase queries can be chatty under concurrency.
+    """
+    try:
+        ws = date.fromisoformat(week_start)
+        we = date.fromisoformat(week_end)
+    except Exception:
+        ws, we = _week_bounds_la()
+    callout_h = 0.0
+    pickup_h = 0.0
+    try:
+        callout_h = callouts_db.sum_callout_hours_for_week(caller_name=user_name, week_start=ws, week_end=we)
+    except Exception:
+        callout_h = 0.0
+    try:
+        pickup_h = pickups_db.sum_pickup_hours_for_week(picker_name=user_name, week_start=ws, week_end=we)
+    except Exception:
+        pickup_h = 0.0
+    return {"callout_hours": float(callout_h), "pickup_hours": float(pickup_h)}
 
 
 def _extract_details_meta(details: str) -> tuple[dict, str]:
@@ -663,19 +775,37 @@ def _render_pickup_tradeboard(ss, schedule_global, canon_user: str | None) -> No
 /* Tradeboard v2: responsive call-out cards (no fixed-height time grid) */
 .tb2-grid { display:flex; gap:12px; align-items:flex-start; }
 .tb2-col { min-width: 210px; flex:1; }
-.tb2-dayhead { font-weight:700; font-size: 0.95rem; color:#111827; margin: 0 0 8px 0; }
-.tb2-empty { color:#6b7280; font-size:0.85rem; padding:10px 8px; border:1px dashed #e5e7eb; border-radius:12px; background:#fafafa; }
-.tb2-card { background:#fff; border:1px solid #fee2e2; border-left: 6px solid #ef4444; border-radius:16px; padding:10px 10px 10px 12px; margin: 0 0 10px 0; box-shadow: 0 1px 8px rgba(0,0,0,0.05); }
+.tb2-dayhead { font-weight:750; font-size: 0.95rem; color: var(--oa-ink, #111827); margin: 0 0 8px 0; }
+.tb2-empty {
+  color: rgba(15,23,42,0.62);
+  font-size:0.85rem;
+  padding:10px 10px;
+  border:1px dashed rgba(15,23,42,0.16);
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(79,70,229,0.06), rgba(20,184,166,0.05));
+  backdrop-filter: blur(6px);
+}
+.tb2-card {
+  /* Soft red accents that match the app's pastel background (less harsh than pure red) */
+  background: linear-gradient(135deg, rgba(238,242,255,0.80), rgba(224,231,255,0.58));
+  border:1px solid rgba(227,81,81,0.18);
+  border-left: 5px solid rgba(227,81,81,0.72);
+  border-radius: 10px;
+  padding:10px 10px 10px 12px;
+  margin: 0 0 10px 0;
+  box-shadow: 0 10px 22px rgba(2,6,23,0.06);
+  backdrop-filter: blur(8px);
+}
 .tb2-top { display:flex; justify-content:space-between; gap:8px; align-items:center; }
 .tb2-time { font-weight:700; font-size:0.92rem; color:#111827; }
-.tb2-badge { font-size:0.72rem; font-weight:700; padding:3px 8px; border-radius:999px; color:#111827; background:#f3f4f6; border:1px solid #e5e7eb; white-space:nowrap; }
+.tb2-badge { font-size:0.72rem; font-weight:750; padding:3px 8px; border-radius:9px; color:#0f172a; background:linear-gradient(135deg, rgba(238,242,255,0.86), rgba(224,231,255,0.66)); border:1px solid rgba(15,23,42,0.12); white-space:nowrap; }
 .tb2-badge.unh { background:#e0f2fe; border-color:#bae6fd; }
 .tb2-badge.mc { background:#dcfce7; border-color:#bbf7d0; }
 .tb2-badge.oncall { background:#ffedd5; border-color:#fed7aa; }
 .tb2-sub { color:#6b7280; font-size:0.78rem; margin-top:4px; }
 .tb2-names { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
-.tb2-nitem { background:#fef2f2; border:1px solid #fecaca; border-radius:12px; padding:6px 8px; font-size:0.82rem; font-weight:650; color:#7f1d1d; line-height:1.1; }
-.tb2-nmore { color:#991b1b; font-size:0.8rem; font-weight:700; padding-left:2px; }
+.tb2-nitem { background:linear-gradient(135deg, rgba(227,81,81,0.10), rgba(238,242,255,0.72)); border:1px solid rgba(227,81,81,0.18); border-radius:8px; padding:6px 8px; font-size:0.82rem; font-weight:650; color:#7f1d1d; line-height:1.1; }
+.tb2-nmore { color:rgba(127,29,29,0.86); font-size:0.8rem; font-weight:700; padding-left:2px; }
 /* Tighten Streamlit widgets inside columns */
 div[data-testid="column"] div.stButton>button { border-radius:12px; }
 </style>
@@ -862,7 +992,11 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                     if not oc_wins:
                         continue  # Mode A: skip weeks with no red call-outs
                     any_shown = True
-                    st.markdown(f"**{oc_title}**  \\n{len(oc_wins)} called-out block(s)")
+                    # Use explicit HTML line break so we never render a literal "\\n".
+                    st.markdown(
+                        f"**{oc_title}**<br>{len(oc_wins)} called-out block(s)",
+                        unsafe_allow_html=True,
+                    )
                     _render_tradeboard_v2("ONCALL", oc_data.get("df"), oc_wins)
                     st.markdown("---")
                 if not any_shown:
@@ -1074,7 +1208,7 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                         st.session_state.pop("TB2_MODAL", None)
                         st.rerun()
                 with c2:
-                    if st.button("Send for approval", type="primary", disabled=not can_submit, key=f"tb2m_send_{mid}"):
+                    if st.button("Send for approval", type="secondary", disabled=not can_submit, key=f"tb2m_send_{mid}"):
                         if not can_submit:
                             st.error("Please fix the issues above before submitting.")
                             return
@@ -1322,7 +1456,7 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                 key="pickup_overtime_choice",
             )
 
-        if st.button("📤 Send pickup request for approval", type="primary", use_container_width=True, key="btn_send_pickup"):
+        if st.button("📤 Send pickup request for approval", type="secondary", use_container_width=True, key="btn_send_pickup"):
             try:
                 bucket = "On-Call" if w.kind == "ONCALL" else w.kind
 
@@ -1383,13 +1517,30 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
 
 
 def run() -> None:
-    st.set_page_config(page_title="OA Schedule Chatbot", page_icon="🗓️", layout="wide")
+    st.set_page_config(page_title="OA Scheduling Assistant", page_icon="🗓️", layout="wide")
+    # Global UI theme (purely visual). Safe: no functional behavior changes.
+    apply_vibrant_theme()
     # Global, fixed footer visible on every screen.
     render_global_footer()
-    st.title("🗓️ OA Schedule Chatbot (Guided)")
-    st.caption(
-        "Enter your name, pick an action (Add / Remove / Call-Out). "
-        "Guided steps ensure caps and available slots."
+
+    # Hero header (visual only)
+    st.markdown(
+        """
+        <div style="
+          padding: 1.05rem 1.15rem;
+          border-radius: 18px;
+          border: 1px solid rgba(15,23,42,0.10);
+          background: linear-gradient(135deg, rgba(79,70,229,0.10), rgba(20,184,166,0.08));
+          box-shadow: 0 12px 30px rgba(2,6,23,0.08);
+          margin-bottom: 1.05rem;
+        ">
+          <div style="font-size: 1.55rem; font-weight: 900; letter-spacing: -0.3px;">🗓️ OA Scheduling Assistant</div>
+          <div style="margin-top: 0.25rem; font-size: 0.98rem; opacity: 0.80;">
+            Enter your name, pick an action (Add / Remove / Call-Out). Guided steps ensure caps and available slots.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     # ------------------------------------------------------------------
@@ -1539,10 +1690,56 @@ def run() -> None:
                         hours_now = float(last.get("hours", 0.0))
                     else:
                         hours_now = compute_hours_fast(ss, schedule_global, canon_tmp, epoch=epoch_key)
+
                 # Save for fast post-write messaging.
                 st.session_state["_LAST_HOURS"] = {"user": canon_tmp, "epoch": epoch_key, "hours": float(hours_now)}
-                st.metric("Current hours (UNH + MC + On-Call)", f"{hours_now:.1f} / 20")
-                st.progress(min(hours_now / 20.0, 1.0))
+
+                # Sidebar hours widget:
+                # - Base scheduled hours come from Sheets (existing behavior).
+                # - If Supabase is configured, adjust with approved callouts/pickups.
+                ws, we = _week_bounds_la()
+                if callouts_db.supabase_callouts_enabled() and pickups_db.supabase_pickups_enabled():
+                    adj = _cached_weekly_supabase_adjustments(canon_tmp, str(ws), str(we))
+                    callout_h = float(adj.get("callout_hours", 0.0))
+                    pickup_h = float(adj.get("pickup_hours", 0.0))
+                    general_h = max(0.0, float(hours_now) - callout_h)
+                    with_cover_h = max(0.0, general_h + pickup_h)
+                else:
+                    callout_h = pickup_h = 0.0
+                    general_h = float(hours_now)
+                    with_cover_h = float(hours_now)
+
+                pct = min(max(with_cover_h / 20.0, 0.0), 1.0)
+                def _fmt_md(d: date) -> str:
+                    try:
+                        return d.strftime('%b %d').replace(' 0', ' ')
+                    except Exception:
+                        return str(d)
+
+                subtitle = f"Week: {_fmt_md(ws)}–{_fmt_md(we)}"
+                st.markdown(
+                    f"""
+                    <div class='oa-hours-card oa-hours-card--classic'>
+                      <div class='oa-hours-card__label'>
+                        General hours <span class='oa-hours-card__scope'>(this week)</span>
+                      </div>
+                      <div class='oa-hours-card__valueBig'>
+                        {general_h:.1f} <span class='oa-hours-card__cap'>/ 20</span>
+                      </div>
+                      <div class='oa-hours-card__subline'>
+                        Hours with cover: <b>{with_cover_h:.1f}</b>
+                      </div>
+                      <div class='oa-hours-bar'>
+                        <div class='oa-hours-bar__fill' style='width:{pct*100:.0f}%'></div>
+                      </div>
+                      <div class='oa-hours-card__hint'>{subtitle}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                if not (callouts_db.supabase_callouts_enabled() and pickups_db.supabase_pickups_enabled()):
+                    st.caption("Cover/callout adjustments unavailable (Supabase not configured).")
 
                 # Lightweight notifications about approval requests.
                 try:
@@ -1716,6 +1913,46 @@ def run() -> None:
                 st.session_state["APPROVALS_EPOCH"] = st.session_state.get("APPROVALS_EPOCH", 0) + 1
                 st.session_state["_SCROLL_TO_PENDING"] = True
                 st.rerun()
+
+        # Admin-only manual sync for swap sections (rendered from Supabase).
+        # This does NOT run automatically on reruns.
+        try:
+            import os
+
+            admin_sync_enabled = str(os.getenv("ADMIN_SYNC", "")).strip().lower() in ("1", "true", "yes")
+            admin_sync_enabled = admin_sync_enabled or bool(st.secrets.get("ADMIN_SYNC", False))
+        except Exception:
+            admin_sync_enabled = False
+
+        if approver_mode and admin_sync_enabled:
+            with top_r:
+                st.caption("Admin")
+                # Simple throttling to avoid accidental repeated clicks on reruns.
+                last = st.session_state.get("_LAST_SWAP_SYNC_TS")
+                now_ts = __import__("time").time()
+                cooldown = 60
+                can_run = not last or (now_ts - float(last)) > cooldown
+                if st.button("🔁 Sync swaps now", disabled=not can_run, key="btn_sync_swaps"):
+                    from ..integrations.supabase_io import supabase_enabled, get_supabase
+                    from ..jobs.sync_swaps_to_sheets import sync_swaps_to_sheets
+
+                    if not supabase_enabled():
+                        st.warning("Supabase not configured — cannot sync swaps.")
+                    else:
+                        try:
+                            sb = get_supabase()
+                            res = sync_swaps_to_sheets(ss, sb)
+                            st.session_state["_LAST_SWAP_SYNC_TS"] = now_ts
+                            st.success(
+                                f"Synced swaps. Weekly written: {res.get('weekly_written')} • "
+                                f"Future written: {res.get('future_written')} • "
+                                f"Sheets: {', '.join(res.get('sheets_updated', []) or [])}"
+                            )
+                        except Exception as e:
+                            st.error(f"Swap sync failed: {str(e)}")
+
+                if not can_run:
+                    st.caption("Synced recently — try again in a minute.")
         with top_r:
             history_rows = st.selectbox(
                 "History depth",
@@ -1738,12 +1975,11 @@ def run() -> None:
 
         pending_ot = [r for r in pending if _is_overtime_request(r)]
         pending_regular = [r for r in pending if not _is_overtime_request(r)]
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Pending", len(pending_regular))
-        m2.metric("Pending OT", len(pending_ot))
-        m3.metric("Approved", sum(1 for r in history if str(r.get("Status", "")).upper() == "APPROVED"))
-        m4.metric("Rejected", sum(1 for r in history if str(r.get("Status", "")).upper() == "REJECTED"))
+        st.caption(
+            f"Pending: {len(pending_regular)} • Pending OT: {len(pending_ot)} • "
+            f"Approved: {sum(1 for r in history if str(r.get('Status', '')).upper() == 'APPROVED')} • "
+            f"Rejected: {sum(1 for r in history if str(r.get('Status', '')).upper() == 'REJECTED')}"
+        )
 
         tab_inbox, tab_ot, tab_hist = st.tabs(
             [f"📥 Inbox ({len(pending_regular)})", f"⏱️ Overtime ({len(pending_ot)})", f"🗂️ History ({len(history)})"]
@@ -1803,7 +2039,7 @@ def run() -> None:
                 m = re.search(r"\bcover\s*=\s*([^|]+)", details_rest, flags=re.I)
                 if m:
                     covered_by = m.group(1).strip()
-                return chat_callout.handle_callout(
+                msg = chat_callout.handle_callout(
                     st,
                     ss,
                     schedule_global,
@@ -1814,6 +2050,59 @@ def run() -> None:
                     end=edt.time(),
                     covered_by=covered_by,
                 )
+                # After Sheets update succeeds, upsert into Supabase callouts table (idempotent).
+                try:
+                    if callouts_db.supabase_callouts_enabled():
+                        approval_id = str(req.get("ID", "")).strip()
+                        created_at = _ensure_la_timestamptz(req.get("Created", ""))
+                        campus_key = utils.normalize_campus(campus_ws_title, campus)
+                        kv = _parse_details_kv(details_rest)
+                        reason = kv.get("reason")
+                        # Event date derivation:
+                        if campus_key in {"UNH", "MC"}:
+                            ds = kv.get("date", "").strip()
+                            if not ds:
+                                raise ValueError("Callout missing date=YYYY-MM-DD in Details")
+                            event_d = date.fromisoformat(ds)
+                        else:
+                            event_d = _oncall_event_date(campus_ws_title or meta.get("sheet_title", ""), day_canon)
+                            if not event_d:
+                                raise ValueError("Could not derive On-Call event date from sheet title")
+
+                        start_at = _combine_date_time_la(event_d, sdt.time())
+                        end_at = _combine_date_time_la(event_d, edt.time())
+                        if end_at <= start_at:
+                            end_at = end_at + timedelta(days=1)
+
+                        callouts_db.upsert_callout(
+                            {
+                                "approval_id": approval_id,
+                                "submitted_at": created_at,
+                                "campus": "ONCALL" if campus_key not in {"UNH", "MC"} else campus_key,
+                                "caller_name": requester,
+                                "reason": reason,
+                                "event_date": str(event_d),
+                                "shift_start_at": start_at.isoformat(timespec="seconds"),
+                                "shift_end_at": end_at.isoformat(timespec="seconds"),
+                            }
+                        )
+                except Exception as e:
+                    # Do not fail the approval if DB write fails.
+                    try:
+                        append_audit(
+                            ss,
+                            actor=canon_name,
+                            action="db_callout_upsert_failed",
+                            campus=campus_ws_title,
+                            day=day,
+                            start=start_s,
+                            end=end_s,
+                            details=str(e),
+                        )
+                    except Exception:
+                        pass
+                    st.warning(f"Sheets updated, but callout DB sync failed: {_strip_debug_blob(str(e))}")
+                return msg
             if action == "pickup":
                 # A pickup request is a *cover* for someone else's callout.
                 # Requester = picker, Details carries the callout target.
@@ -1821,7 +2110,7 @@ def run() -> None:
                 if not m:
                     raise ValueError("Pickup request missing Details: target=<called-out OA>")
                 target = m.group(1).strip()
-                return chat_callout.handle_callout(
+                msg = chat_callout.handle_callout(
                     st,
                     ss,
                     schedule_global,
@@ -1832,6 +2121,66 @@ def run() -> None:
                     end=edt.time(),
                     covered_by=requester,
                 )
+                try:
+                    if pickups_db.supabase_pickups_enabled():
+                        approval_id = str(req.get("ID", "")).strip()
+                        created_at = _ensure_la_timestamptz(req.get("Created", ""))
+                        campus_key = utils.normalize_campus(campus_ws_title, campus)
+                        kv = _parse_details_kv(details_rest)
+
+                        # Event date derivation:
+                        ds = kv.get("date", "").strip()
+                        if ds:
+                            event_d = date.fromisoformat(ds)
+                        elif campus_key in {"UNH", "MC"}:
+                            # UNH/MC pick-ups are assumed to occur in the current week.
+                            ws, _ = _week_bounds_la()
+                            want = utils.normalize_day(day_canon)
+                            event_d = ws
+                            for i in range(7):
+                                cand = ws + timedelta(days=i)
+                                if utils.normalize_day(cand.strftime("%A")) == want:
+                                    event_d = cand
+                                    break
+                        else:
+                            event_d = _oncall_event_date(campus_ws_title or meta.get("sheet_title", ""), day_canon)
+                            if not event_d:
+                                raise ValueError("Could not derive On-Call event date from sheet title")
+
+                        start_at = _combine_date_time_la(event_d, sdt.time())
+                        end_at = _combine_date_time_la(event_d, edt.time())
+                        if end_at <= start_at:
+                            end_at = end_at + timedelta(days=1)
+
+                        pickups_db.upsert_pickup(
+                            {
+                                "approval_id": approval_id,
+                                "submitted_at": created_at,
+                                "campus": "ONCALL" if campus_key not in {"UNH", "MC"} else campus_key,
+                                "event_date": str(event_d),
+                                "shift_start_at": start_at.isoformat(timespec="seconds"),
+                                "shift_end_at": end_at.isoformat(timespec="seconds"),
+                                "picker_name": requester,
+                                "target_name": target,
+                                "note": kv.get("note"),
+                            }
+                        )
+                except Exception as e:
+                    try:
+                        append_audit(
+                            ss,
+                            actor=canon_name,
+                            action="db_pickup_upsert_failed",
+                            campus=campus_ws_title,
+                            day=day,
+                            start=start_s,
+                            end=end_s,
+                            details=str(e),
+                        )
+                    except Exception:
+                        pass
+                    st.warning(f"Sheets updated, but pickup DB sync failed: {_strip_debug_blob(str(e))}")
+                return msg
             raise ValueError(f"Unknown action: {action}")
 
         def _render_pending_tab(pending_rows: list[dict], *, key_prefix: str, empty_msg: str) -> None:
@@ -2038,10 +2387,7 @@ def run() -> None:
         mine = _requests_for_user(rows_all, canon_name)
         pending = [r for r in mine if str(r.get("Status", "")).upper() == "PENDING"]
         history = [r for r in mine if str(r.get("Status", "")).upper() != "PENDING"]
-
-        m1, m2 = st.columns(2)
-        m1.metric("Pending", len(pending))
-        m2.metric("Decisions", len(history))
+        st.caption(f"Pending: {len(pending)} • Decisions: {len(history)}")
 
         t1, t2 = st.tabs([f"🕓 Pending ({len(pending)})", f"✅ History ({len(history)})"])
         with t1:
@@ -2500,12 +2846,79 @@ def run() -> None:
                 sdt = datetime.strptime(s_str, "%I:%M %p")
                 edt = datetime.strptime(e_str, "%I:%M %p")
 
+                # UNH/MC callouts need an explicit calendar date (used for Supabase + reports).
+                event_date = None
+                if kind in {"UNH", "MC"}:
+                    ws, we = _week_bounds_la()
+                    # Default to the day within this week that matches the selected weekday.
+                    default_d = ws
+                    try:
+                        want = utils.normalize_day(day_canon)
+                        for i in range(7):
+                            cand = ws + timedelta(days=i)
+                            if utils.normalize_day(cand.strftime("%A")) == want:
+                                default_d = cand
+                                break
+                    except Exception:
+                        default_d = _la_today()
+                    event_date = st.date_input("Date of shift", value=default_d, key="callout.date")
+
+                reason_opt = st.selectbox(
+                    "Reason",
+                    options=["sick", "personal", "emergency", "other"],
+                    index=0,
+                    key="callout.reason",
+                )
+                reason = reason_opt
+                if reason_opt == "other":
+                    other_txt = st.text_input("If other, describe briefly", key="callout.reason_other")
+                    reason = f"other:{other_txt.strip()}" if other_txt.strip() else "other"
+
                 have_cover = st.radio("Do you have coverage?", ["No", "Yes"], horizontal=True) == "Yes"
                 cover_name = st.text_input("Enter covering OA name (exact roster name)") if have_cover else ""
+
+                # Minimal UI change: allow submitting callouts for approval (especially for UNH/MC).
+                want_approval = st.checkbox(
+                    "Send for approval",
+                    value=True if kind in {"UNH", "MC"} else False,
+                    key="callout.want_approval",
+                )
 
                 if st.button("Apply Call-Out"):
                     try:
                         details = "cover=" + cover_name if have_cover else "no cover"
+
+                        # If submitting to approvals, store machine-parsable tokens.
+                        if want_approval:
+                            if kind in {"UNH", "MC"}:
+                                if not event_date:
+                                    raise ValueError("Callout missing date. Please select a date for UNH/MC callouts.")
+                                details_tokens = f"date={event_date.isoformat()} | reason={reason} | {details}"
+                            else:
+                                # On-Call event_date is derived on approval using META sheet_title + weekday.
+                                details_tokens = f"reason={reason} | {details}"
+
+                            rid = submit_approval_request(
+                                ss,
+                                requester=canon_name,
+                                action="callout",
+                                campus=("ONCALL" if kind == "ONCALL" else kind),
+                                day=day_canon.title(),
+                                start=fmt_time(sdt),
+                                end=fmt_time(edt),
+                                details=_attach_details_meta(
+                                    details=details_tokens,
+                                    campus_key=("ONCALL" if kind == "ONCALL" else kind),
+                                    sheet_title=active_tab,
+                                    sheet_gid=_sheet_gid_for_title(schedule_global, active_tab),
+                                ),
+                            )
+                            st.session_state["mode"] = None
+                            st.session_state["sched_expanded"] = True
+                            _flash("success", f"🕓 Submitted for approval (id {rid}).")
+                            st.rerun()
+
+                        # Direct apply (legacy behavior)
                         msg = chat_callout.handle_callout(
                             st,
                             ss,
@@ -2527,7 +2940,7 @@ def run() -> None:
                                 day=day_canon.title(),
                                 start=fmt_time(sdt),
                                 end=fmt_time(edt),
-                                details=details,
+                                details=f"{details} | reason={reason}",
                             )
                         except Exception:
                             st.toast("Note: logging skipped due to quota.", icon="⚠️")

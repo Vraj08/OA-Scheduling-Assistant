@@ -167,8 +167,11 @@ def handle_callout(
     """
     Mark a Call-Out:
       • If covered_by is None/empty → color cell RED.
-      • If covered_by is provided → color cell ORANGE and append a shift-swap note
-        under the 'Shift Swaps for the week' header (without touching hour counts).
+      • If covered_by is provided → color cell ORANGE.
+
+    Note: Swap section logging ("Shift Swaps for the week" / "Future Swaps/Call outs")
+    is now rendered idempotently from Supabase via oa_app.jobs.sync_swaps_to_sheets.
+    This function only marks the schedule grid cells.
     Works for UNH/MC (half-hour lanes) and On-Call (fixed blocks).
     """
     dbg_log: list[str] = []
@@ -285,48 +288,7 @@ def handle_callout(
     color = _ORANGE if covered_by else _RED
     _format_cells(ws, target_coords, color)
 
-    # 2) If covered, append a note under 'Shift Swaps for the week' (next empty cell, no overwrite)
-    if covered_by:
-        loc = _find_shift_swaps_col(grid)
-        if loc is not None:
-            hr, sc = loc
-
-            max_r = min(ONCALL_MAX_ROWS, max(len(grid), hr + 120))
-            target_cell: tuple[int, int] | None = None
-            for rr in range(hr + 1, max_r):
-                v = (grid[rr][sc] if rr < len(grid) and sc < len(grid[rr]) else "") or ""
-                if _is_blankish(v):
-                    target_cell = (rr, sc)
-                    break
-
-            if target_cell is None:
-                target_cell = (min(max_r - 1, hr + 1), sc)
-
-            # Desired text format: "Tessa Shepard covering Vraj from 1-3:30 pm, 10/21"
-            # Use the actual datetime window and try to extract mm/dd from the header col.
-            tr = _fmt_swap_timerange(sdt, edt)
-            mmdd = _extract_mmdd_for_day_col(grid, c0)
-            swap_text = f"{covered_by} covering {canon_target_name} from {tr}"
-            if mmdd:
-                swap_text = f"{swap_text}, {mmdd}"
-
-            # Write the swap text (single cell update)
-            try:
-                import gspread.utils as a1
-                rr, cc = target_cell
-                ref = a1.rowcol_to_a1(rr + 1, cc + 1)
-                ws.batch_update([{"range": f"{ref}:{ref}", "values": [[swap_text]]}])
-
-                # keep our in-memory grid updated for seeding
-                if rr < len(grid):
-                    if cc >= len(grid[rr]):
-                        grid[rr] = list(grid[rr]) + [""] * (cc + 1 - len(grid[rr]))
-                    grid[rr][cc] = swap_text
-            except Exception:
-                # Best effort: callout formatting already applied
-                pass
-
-    # 3) Bump sheet version + seed cache so UI is fast on rerun
+    # 2) Bump sheet version + seed cache so UI is fast on rerun
     try:
         import gspread.utils as a1
         bump_ws_version(ws)
@@ -346,6 +308,6 @@ def handle_callout(
     if covered_by:
         return (
             f"Call-Out marked for **{canon_target_name}** on **{campus_title}** ({label}) — "
-            f"**orange** (covered). Logged under **Shift Swaps for the week**."
+            f"**orange** (covered)."
         )
     return f"Call-Out marked for **{canon_target_name}** on **{campus_title}** ({label}) — **red** (no cover)."

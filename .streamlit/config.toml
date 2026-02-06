@@ -1,0 +1,7 @@
+[theme]
+base = "light"
+primaryColor = "#4F46E5"          # indigo
+backgroundColor = "#F6F7FB"       # soft light
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0F172A"            # slate-900
+font = "sans serif"
