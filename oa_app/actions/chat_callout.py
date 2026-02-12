@@ -1,7 +1,7 @@
 # oa_app/chat_callout.py
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 import re
 import gspread
@@ -132,6 +132,31 @@ def _find_oncall_day_col(grid: list[list[str]], day_canon: str, ws_title: str) -
                 return c
 
     return c_guess
+
+
+def _oncall_ref_date(ws_title: str, day_canon: str) -> Optional[date]:
+    """Return the calendar date for an On-Call weekday within the worksheet week.
+
+    On-Call block labels only encode *times* (e.g., "7:00 PM - 12:00 AM").
+    When we compare ranges we must anchor both the requested window and the
+    block label window to the *same* calendar date, otherwise overlap checks
+    will fail (e.g., 1900 vs 2026).
+    """
+    try:
+        rng = week_range.week_range_from_title(ws_title)
+    except Exception:
+        rng = None
+    if not rng:
+        return None
+    ws0, _ws1 = rng
+    order = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    dc = (day_canon or "").strip().lower()
+    if dc not in order:
+        return None
+    try:
+        return ws0 + timedelta(days=order.index(dc))
+    except Exception:
+        return None
 
 
 def _format_cells(ws: gspread.Worksheet, coords: list[tuple[int, int]], rgb: dict) -> None:
@@ -272,8 +297,24 @@ def handle_callout(
     except Exception as e:
         fail(f"Could not open worksheet '{campus_title}': {e}")
 
-    sdt = _ensure_dt(start)
+    # On-Call labels contain only times, so we must anchor requested start/end
+    # to the correct calendar date within the On-Call week (derived from title).
+    ref_date = _oncall_ref_date(ws.title, day) if kind == "ONCALL" else None
+
+    sdt = _ensure_dt(start, ref_date=ref_date)
+    # If the UI passed a datetime with a different date, coerce it to ref_date.
+    if kind == "ONCALL" and ref_date is not None:
+        try:
+            sdt = sdt.replace(year=ref_date.year, month=ref_date.month, day=ref_date.day)
+        except Exception:
+            pass
+
     edt = _ensure_dt(end, ref_date=sdt.date())
+    if kind == "ONCALL" and ref_date is not None:
+        try:
+            edt = edt.replace(year=sdt.year, month=sdt.month, day=sdt.day)
+        except Exception:
+            pass
 
     if edt <= sdt:
         if 0 <= edt.time().hour <= 5:
@@ -338,6 +379,16 @@ def handle_callout(
             be = _parse_time_cell(m.group(2))
             if not bs or not be:
                 continue
+
+            # Anchor On-Call label times to the same calendar date as the
+            # requested window so the overlap test is meaningful.
+            try:
+                anchor = sdt.date()
+                bs = datetime.combine(anchor, bs.time())
+                be = datetime.combine(anchor, be.time())
+            except Exception:
+                pass
+
             if be <= bs:
                 be = be + timedelta(days=1)
 
