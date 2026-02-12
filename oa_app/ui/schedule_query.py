@@ -9,6 +9,8 @@ import gspread.utils as a1
 import pandas as pd
 import plotly.express as px
 
+from ..core import week_range as week_range_mod
+
 from ..config import (
     OA_SCHEDULE_SHEETS,   # e.g. ["UNH (OA and GOAs)", "MC (OA and GOAs)"]
     ROSTER_SHEET,
@@ -177,7 +179,7 @@ def _open_three(ss: gspread.Spreadsheet) -> List[str]:
         mc  = _resolve_from_titles(titles, mc_cfg)
         if unh: out.append(unh)
         if mc:  out.append(mc)
-        # On-Call (override → else find an actual On-Call tab)
+        # On-Call (prefer the tab for the current week; never use On Call General)
         # IMPORTANT: do NOT accidentally treat the roster sheet as On-Call.
         oncall = None
         deny = {str(AUDIT_SHEET).strip().lower(), str(LOCKS_SHEET).strip().lower(), str(ROSTER_SHEET).strip().lower()}
@@ -191,7 +193,30 @@ def _open_three(ss: gspread.Spreadsheet) -> List[str]:
             if cand and cand.strip().lower() not in deny:
                 oncall = cand
 
-        # Prefer a matching title after MC, but fall back to any matching title.
+        # 1) Try exact week-range match for *this week* in Los Angeles.
+        if not oncall:
+            try:
+                today = week_range_mod.la_today()
+                # Our schedules use a Sunday–Saturday week.
+                sunday_offset = (today.weekday() + 1) % 7  # Mon=0..Sun=6
+                ws = today - timedelta(days=sunday_offset)
+                we = ws + timedelta(days=6)
+                for cand in titles:
+                    tl = cand.strip().lower()
+                    if tl in deny:
+                        continue
+                    if "general" in tl:
+                        continue
+                    if not _looks_oncall(cand):
+                        continue
+                    wr = week_range_mod.week_range_from_title(cand, today=today)
+                    if wr and wr == (ws, we):
+                        oncall = cand
+                        break
+            except Exception:
+                pass
+
+        # 2) Fallback: prefer a matching-looking title after MC, then any on-call.
         if not oncall:
             start = -1
             try:
@@ -200,12 +225,18 @@ def _open_three(ss: gspread.Spreadsheet) -> List[str]:
                 start = -1
             if start >= 0:
                 for cand in titles[start:]:
-                    if cand.strip().lower() not in deny and _looks_oncall(cand):
+                    tl = cand.strip().lower()
+                    if tl in deny or "general" in tl:
+                        continue
+                    if _looks_oncall(cand):
                         oncall = cand
                         break
         if not oncall:
             for cand in titles:
-                if cand.strip().lower() not in deny and _looks_oncall(cand):
+                tl = cand.strip().lower()
+                if tl in deny or "general" in tl:
+                    continue
+                if _looks_oncall(cand):
                     oncall = cand
                     break
 
@@ -239,6 +270,28 @@ def _open_three(ss: gspread.Spreadsheet) -> List[str]:
             if cand and cand.strip().lower() not in deny:
                 oncall = cand
 
+        # 1) Try exact week-range match for *this week* in Los Angeles.
+        if not oncall:
+            try:
+                today = week_range_mod.la_today()
+                sunday_offset = (today.weekday() + 1) % 7
+                ws = today - timedelta(days=sunday_offset)
+                we = ws + timedelta(days=6)
+                for w in ws_list:
+                    cand = w.title
+                    tl = cand.strip().lower()
+                    if tl in deny or "general" in tl:
+                        continue
+                    if not _looks_oncall_ws(cand):
+                        continue
+                    wr = week_range_mod.week_range_from_title(cand, today=today)
+                    if wr and wr == (ws, we):
+                        oncall = cand
+                        break
+            except Exception:
+                pass
+
+        # 2) Fallback: prefer neighbor after MC, then any on-call.
         if not oncall and mc:
             try:
                 idx = next(i for i, w in enumerate(ws_list) if w.title == mc)
@@ -247,14 +300,20 @@ def _open_three(ss: gspread.Spreadsheet) -> List[str]:
             if idx >= 0:
                 for w in ws_list[idx+1:]:
                     cand = w.title
-                    if cand.strip().lower() not in deny and _looks_oncall_ws(cand):
+                    tl = cand.strip().lower()
+                    if tl in deny or "general" in tl:
+                        continue
+                    if _looks_oncall_ws(cand):
                         oncall = cand
                         break
 
         if not oncall:
             for w in ws_list:
                 cand = w.title
-                if cand.strip().lower() not in deny and _looks_oncall_ws(cand):
+                tl = cand.strip().lower()
+                if tl in deny or "general" in tl:
+                    continue
+                if _looks_oncall_ws(cand):
                     oncall = cand
                     break
 

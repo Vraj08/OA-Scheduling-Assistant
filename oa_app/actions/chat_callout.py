@@ -21,6 +21,7 @@ from .chat_add import (
 from ..ui.schedule_query import _read_grid, _RANGE_RE, _parse_time_cell, _TIME_CELL_RE
 from ..core.quotas import bump_ws_version, seed_batch_get_cache
 from ..config import ONCALL_MAX_COLS, ONCALL_MAX_ROWS
+from ..core import week_range
 
 # Simple color helpers
 _ORANGE = {"red": 1.0, "green": 0.65, "blue": 0.0}
@@ -51,6 +52,86 @@ def _find_day_col(grid: list[list[str]], day_canon: str) -> int | None:
         if g2 is not None:
             day_cols[day_canon] = g2
     return day_cols.get(day_canon)
+
+
+def _cell_has_name_loose(cell: str, canon_name: str) -> bool:
+    """Loose match for names inside schedule cells.
+
+    Sheets often store lanes as "OA: Name" / "GOA: Name" and can contain
+    non‑breaking spaces or extra whitespace. We treat the OA name as a
+    case‑insensitive substring after light normalization.
+    """
+    if not cell or not canon_name:
+        return False
+    c = str(cell).replace("\xa0", " ").strip().lower()
+    c = re.sub(r"\b(oa|goa)\s*:\s*", "", c, flags=re.I)
+    c = re.sub(r"\s+", " ", c)
+    t = str(canon_name).replace("\xa0", " ").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t in c
+
+
+def _find_oncall_day_col(grid: list[list[str]], day_canon: str, ws_title: str) -> int | None:
+    """Find the day column for On-Call tabs.
+
+    Some On-Call templates only show dates (e.g., "2/8") rather than weekday
+    names. Inferring weekdays from a date *without a year* can be wrong.
+
+    We therefore prefer matching the column by its month/day within the
+    worksheet's week range (derived from the tab title).
+    """
+    try:
+        rng = week_range.week_range_from_title(ws_title)
+    except Exception:
+        rng = None
+
+    # First try the generic day-column logic.
+    c_guess = _find_day_col(grid, day_canon)
+
+    if not rng or not grid:
+        return c_guess
+
+    ws0, ws1 = rng
+    order = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    if day_canon not in order:
+        return c_guess
+    try:
+        target_d = ws0 + timedelta(days=order.index(day_canon))
+    except Exception:
+        return c_guess
+
+    mm, dd = target_d.month, target_d.day
+
+    def _mmdd_match(txt: str) -> bool:
+        s = (txt or "").replace("\xa0", " ")
+        # direct M/D or MM/DD tokens
+        m = re.search(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", s)
+        if m:
+            try:
+                return int(m.group(1)) == mm and int(m.group(2)) == dd
+            except Exception:
+                return False
+        # month name + day
+        try:
+            from dateutil import parser as dateparser
+
+            dt = dateparser.parse(s, fuzzy=True, default=datetime(target_d.year, 1, 1))
+            if dt:
+                return dt.month == mm and dt.day == dd
+        except Exception:
+            pass
+        return False
+
+    # Scan the visible header area (first ~6 rows) for the date token.
+    R = min(len(grid), 6)
+    C = max((len(r) for r in grid[:R]), default=0)
+    for c in range(C):
+        for r in range(R):
+            v = (grid[r][c] if c < len(grid[r]) else "") or ""
+            if v and _mmdd_match(str(v)):
+                return c
+
+    return c_guess
 
 
 def _format_cells(ws: gspread.Worksheet, coords: list[tuple[int, int]], rgb: dict) -> None:
@@ -207,7 +288,10 @@ def handle_callout(
         fail("Empty sheet.")
 
     day_canon = (day or "").strip().lower()
-    c0 = _find_day_col(grid, day_canon)
+    if kind == "ONCALL":
+        c0 = _find_oncall_day_col(grid, day_canon, ws.title)
+    else:
+        c0 = _find_day_col(grid, day_canon)
     if c0 is None:
         fail(f"Could not map weekday '{day_canon.title()}' to a column in '{ws.title}'.")
 
@@ -215,41 +299,63 @@ def handle_callout(
     target_coords: list[tuple[int, int]] = []  # (row_idx_0, col_idx_0)
 
     if kind == "ONCALL":
-        want_s = sdt.strftime("%I:%M %p")
-        want_e = edt.strftime("%I:%M %p")
+        # On-Call tabs vary in layout:
+        #   (1) shared block label in column A
+        #   (2) per-day block labels in the day columns
+        # We support partial windows by coloring any block that overlaps the
+        # requested time window.
 
+        def _overlaps(a0: datetime, a1: datetime, b0: datetime, b1: datetime) -> bool:
+            return (a0 < b1) and (a1 > b0)
+
+        # Identify label rows: any row that has a time-range label either in col A or this day column.
         label_rows: list[int] = []
         for r in range(len(grid)):
-            v = (grid[r][c0] if c0 < len(grid[r]) else "") or ""
-            if _RANGE_RE.match(v or ""):
+            v0 = (grid[r][0] if len(grid[r]) > 0 else "") or ""
+            vd = (grid[r][c0] if c0 < len(grid[r]) else "") or ""
+            if _RANGE_RE.match(str(v0).strip()) or _RANGE_RE.match(str(vd).strip()):
                 label_rows.append(r)
 
-        r_label = None
-        r_next = len(grid)
-        for i, r in enumerate(label_rows):
-            v = (grid[r][c0] if c0 < len(grid[r]) else "") or ""
-            m = _RANGE_RE.match(v or "")
+        if not label_rows:
+            fail("Couldn't find On-Call block labels.")
+
+        label_rows.append(len(grid))
+
+        for i in range(len(label_rows) - 1):
+            r_label = label_rows[i]
+            r_next = label_rows[i + 1]
+
+            shared_v0 = (grid[r_label][0] if len(grid[r_label]) > 0 else "") or ""
+            day_v = (grid[r_label][c0] if c0 < len(grid[r_label]) else "") or ""
+
+            # Prefer per-day label if present; otherwise fall back to shared label.
+            range_txt = day_v if _RANGE_RE.match(str(day_v).strip()) else shared_v0
+            m = _RANGE_RE.match(str(range_txt).strip()) if range_txt else None
             if not m:
                 continue
-            s_raw, e_raw = m.group(1), m.group(2)
-            s2, e2 = _parse_time_cell(s_raw), _parse_time_cell(e_raw)
-            if s2 and e2 and s2.strftime("%I:%M %p") == want_s and e2.strftime("%I:%M %p") == want_e:
-                r_label = r
-                r_next = (label_rows[i + 1] if i + 1 < len(label_rows) else len(grid))
-                break
 
-        if r_label is None:
-            fail(f"Could not locate On-Call block '{want_s} – {want_e}'.")
+            bs = _parse_time_cell(m.group(1))
+            be = _parse_time_cell(m.group(2))
+            if not bs or not be:
+                continue
+            if be <= bs:
+                be = be + timedelta(days=1)
 
-        lane_rows = list(range(r_label + 1, r_next))
-        for rr in lane_rows:
-            v = (grid[rr][c0] if (rr < len(grid) and c0 < len(grid[rr])) else "") or ""
-            if v and canon_target_name.lower() in v.lower():
-                target_coords.append((rr, c0))
-                break
+            if not _overlaps(bs, be, sdt, edt):
+                continue
+
+            # Search lane rows within this block for the target name.
+            for rr in range(r_label + 1, r_next):
+                if rr >= len(grid):
+                    continue
+                if c0 >= len(grid[rr]):
+                    continue
+                v = (grid[rr][c0] if c0 < len(grid[rr]) else "") or ""
+                if _cell_has_name_loose(v, canon_target_name):
+                    target_coords.append((rr, c0))
 
         if not target_coords:
-            fail(f"{canon_target_name} not found in that On-Call block.")
+            fail(f"{canon_target_name} not found in On-Call lanes for the selected window.")
 
     else:
         # UNH / MC: mark every half-hour slot in the window where this OA appears in a lane.
@@ -277,7 +383,7 @@ def handle_callout(
             lane_rows = list(range(r0 + 1, r1))
             for rr in lane_rows:
                 v = (grid[rr][c0] if (rr < len(grid) and c0 < len(grid[rr])) else "") or ""
-                if v and canon_target_name.lower() in v.lower():
+                if _cell_has_name_loose(v, canon_target_name):
                     target_coords.append((rr, c0))
                     break
 

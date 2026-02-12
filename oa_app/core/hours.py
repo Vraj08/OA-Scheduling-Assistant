@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import re
+from datetime import timedelta, datetime
 from typing import Iterable, List, Optional, Tuple, Dict
 
 import streamlit as st
@@ -18,6 +19,7 @@ from ..config import (
     ONCALL_SHEET_OVERRIDE,  # optional override of On-Call tab name
 )
 from .quotas import _safe_batch_get, read_day_column_map_cached
+from . import week_range as week_range_mod
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,24 +125,55 @@ def _three_titles_unh_mc_oncall(ss: gspread.Spreadsheet) -> list[str]:
     if mc_title:
         out.append(mc_title)
 
-    # Prefer explicit override; else pick the visible neighbor to MC’s right.
+    # On-Call selection:
+    #   1) If override set, use it.
+    #   2) Prefer the On-Call tab whose title week-range matches *this week* (LA).
+    #   3) Fall back to the visible neighbor to MC’s right.
     oncall_title = None
-    if mc_title:
-        if ONCALL_SHEET_OVERRIDE and ONCALL_SHEET_OVERRIDE.strip():
-            oncall_title = _resolve_from_titles(ONCALL_SHEET_OVERRIDE)
-        else:
-            try:
-                idx = titles.index(mc_title)
-            except ValueError:
-                idx = -1
-            if idx >= 0:
-                j = idx + 1
-                while j < len(titles):
-                    cand = titles[j]
-                    if cand.strip().lower() not in _DENY_LOW:
-                        oncall_title = cand
-                        break
+    if ONCALL_SHEET_OVERRIDE and ONCALL_SHEET_OVERRIDE.strip():
+        oncall_title = _resolve_from_titles(ONCALL_SHEET_OVERRIDE)
+
+    def _looks_oncall(title: str) -> bool:
+        tl = (title or "").lower()
+        return ("on call" in tl) or ("oncall" in tl)
+
+    if not oncall_title:
+        try:
+            today = week_range_mod.la_today()
+            # Sunday–Saturday week.
+            sunday_offset = (today.weekday() + 1) % 7
+            ws = today - timedelta(days=sunday_offset)
+            we = ws + timedelta(days=6)
+            for cand in titles:
+                tl = cand.strip().lower()
+                if tl in _DENY_LOW or "general" in tl:
+                    continue
+                if not _looks_oncall(cand):
+                    continue
+                wr = week_range_mod.week_range_from_title(cand, today=today)
+                if wr and wr == (ws, we):
+                    oncall_title = cand
+                    break
+        except Exception:
+            pass
+
+    if not oncall_title and mc_title:
+        try:
+            idx = titles.index(mc_title)
+        except ValueError:
+            idx = -1
+        if idx >= 0:
+            j = idx + 1
+            while j < len(titles):
+                cand = titles[j]
+                tl = cand.strip().lower()
+                if tl in _DENY_LOW or "general" in tl:
                     j += 1
+                    continue
+                if _looks_oncall(cand):
+                    oncall_title = cand
+                    break
+                j += 1
 
     if oncall_title:
         out.append(oncall_title)
@@ -257,6 +290,49 @@ def _count_oncall_by_day_headers(ws: gspread.Worksheet, canon_name: str) -> floa
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Robust weekly-hour totals (UNH/MC 30-min grid, On-Call blocks)
+#
+# IMPORTANT:
+# The older "scan every cell in A1:Z1000 and add 0.5h for every mention" approach
+# is not reliable in production because it can:
+#   - miss valid shifts when cells include extra text (e.g., "Sydney Hunter (MC)")
+#   - accidentally count mentions in non-schedule areas (e.g., swap sections)
+#
+# The UI already has a robust parser (schedule_query) that finds time rows,
+# derives per-day intervals, and merges contiguous 30-min slots. We reuse that
+# parsing here so the sidebar hours card matches the "Full Schedule Table".
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _mins_between_12h(s: str, e: str) -> int:
+    """Minutes between two 12h time strings like '10:30 AM'.
+
+    Allows ranges that roll past midnight (On-Call)."""
+    try:
+        sd = datetime.strptime(str(s).strip(), "%I:%M %p")
+        ed = datetime.strptime(str(e).strip(), "%I:%M %p")
+    except Exception:
+        return 0
+    if ed <= sd:
+        ed += timedelta(days=1)
+    return int((ed - sd).total_seconds() // 60)
+
+
+def _hours_from_user_sched(user_sched: dict) -> float:
+    total_mins = 0
+    for buckets in (user_sched or {}).values():
+        if not isinstance(buckets, dict):
+            continue
+        for k in ("UNH", "MC", "On-Call"):
+            for pair in (buckets.get(k, []) or []):
+                try:
+                    s, e = pair
+                except Exception:
+                    continue
+                total_mins += _mins_between_12h(s, e)
+    return float(total_mins) / 60.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Cache-busting for strict recomputes
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -296,24 +372,59 @@ def _clear_ws_cache_for_titles(ss: gspread.Spreadsheet, schedule, titles: list[s
 def compute_hours_fast(_ss, _schedule, canon_name: str, epoch) -> float:
     """
     Cached sidebar metric. Returns the **uncapped** total hours for the week.
-    UNH + MC: 0.5h per cell
-    On-Call: 5h per mention in Mon–Fri columns; 4h in Sat/Sun; if no header → 5h.
+    Uses the same parser as the "Full Schedule Table":
+      - UNH/MC: derive 30-min slots from time rows + day columns and merge contiguous slots
+      - On-Call: parse explicit time-range blocks
     Notes:
       - `epoch` is only used as a cache key. The UI should pass a value derived
         from worksheet versions (e.g., a tuple of (title, version) pairs). This
         keeps the sidebar fast while still updating immediately after writes.
     """
+    # Titles are best-effort; we can still compute hours even if only one of
+    # UNH/MC is present (or if a campus tab is temporarily unavailable).
     titles = _three_titles_unh_mc_oncall(_ss)
-    if len(titles) < 2:
+    if len(titles) < 1:
         return 0.0
 
+    # Prefer the robust parser used for the schedule viz/table.
+    # IMPORTANT: Some edge cases (e.g., transient title resolution glitches,
+    # or week-title parsing differences) can return an empty schedule even when
+    # the chart/table already show shifts. To avoid showing "0.0" incorrectly,
+    # we retry via the same heuristic used by the schedule chart before falling
+    # back to the legacy grid scan.
+    try:
+        from ..ui import schedule_query
+
+        unh_title = titles[0] if len(titles) >= 1 else None
+        mc_title = titles[1] if len(titles) >= 2 else None
+        on_title = titles[2] if len(titles) >= 3 else None
+
+        user_sched = schedule_query.get_user_schedule_for_titles(
+            _ss,
+            _schedule,
+            canon_name,
+            unh_title=unh_title,
+            mc_title=mc_title,
+            oncall_title=on_title,
+        )
+        h = _hours_from_user_sched(user_sched)
+        if h > 0:
+            return h
+
+        # Retry using the chart/table heuristic (open_three), which is often
+        # more forgiving if a title couldn't be resolved in this run.
+        user_sched2 = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
+        h2 = _hours_from_user_sched(user_sched2)
+        if h2 > 0:
+            return h2
+
+        # Fall through to legacy scan as a last resort.
+    except Exception:
+        pass
+
+    # Fallback (legacy): grid scan. Kept as a safety net.
     total_unh = total_mc = total_on = 0.0
 
-    # 1) UNH + MC
-    #
-    # We intentionally use the full-grid counter here. It is *one* batch_get per
-    # sheet (read-through cached by worksheet version) and is the most robust
-    # across the various sheet layouts you have in production.
     for idx, label in enumerate(("UNH", "MC")):
         if len(titles) <= idx:
             continue
@@ -328,7 +439,6 @@ def compute_hours_fast(_ss, _schedule, canon_name: str, epoch) -> float:
         else:
             total_mc = subtotal
 
-    # 2) On-Call (neighbor to MC)
     if len(titles) >= 3:
         try:
             ws_on = _ss.worksheet(titles[2])
@@ -347,22 +457,54 @@ def total_hours_from_unh_mc_and_neighbor(_ss: gspread.Spreadsheet, _schedule, ca
     """
     Fresh (non-cached) strict total used for the 20h cap check when adding shifts.
     Returns the **uncapped** total.
+    Uses the same parser as the sidebar hours metric so validation matches what users see.
     """
     # "Strict" total used for cap checks. We no longer hard-clear caches here
     # because it forces an expensive full refetch on every add/remove.
     # Read-through caching is keyed by worksheet version; writes bump version.
     titles = _three_titles_unh_mc_oncall(_ss)
+    if len(titles) < 1:
+        return 0.0
 
+    # Use the same robust parser as the sidebar so cap checks match what users see.
+    try:
+        from ..ui import schedule_query
+
+        unh_title = titles[0] if len(titles) >= 1 else None
+        mc_title = titles[1] if len(titles) >= 2 else None
+        on_title = titles[2] if len(titles) >= 3 else None
+
+        user_sched = schedule_query.get_user_schedule_for_titles(
+            _ss,
+            _schedule,
+            canon_name,
+            unh_title=unh_title,
+            mc_title=mc_title,
+            oncall_title=on_title,
+        )
+        h = _hours_from_user_sched(user_sched)
+        if h > 0:
+            return h
+
+        # Retry using chart/table heuristic
+        user_sched2 = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
+        h2 = _hours_from_user_sched(user_sched2)
+        if h2 > 0:
+            return h2
+
+        # Fall through to legacy scan
+    except Exception:
+        pass
+
+    # Fallback to legacy scan if something unexpected happens.
     total_unh = total_mc = total_on = 0.0
 
-    # UNH + MC (fresh)
     for idx, label in enumerate(("UNH", "MC")):
         if len(titles) <= idx:
             continue
         t = titles[idx]
         try:
             ws = _ss.worksheet(t)
-            # In fresh mode, prefer raw grid
             subtotal = _count_half_hour_grid(ws, canon_name)
         except Exception:
             subtotal = 0.0
@@ -371,7 +513,6 @@ def total_hours_from_unh_mc_and_neighbor(_ss: gspread.Spreadsheet, _schedule, ca
         else:
             total_mc = subtotal
 
-    # Neighbor (On-Call)
     if len(titles) >= 3:
         try:
             ws_on = _ss.worksheet(titles[2])

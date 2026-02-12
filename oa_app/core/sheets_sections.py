@@ -19,7 +19,57 @@ import gspread.utils as a1
 
 
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+    """Normalization used for header matching.
+
+    We intentionally tolerate minor punctuation differences across sheet templates.
+    """
+    s = (s or "").strip().lower()
+    # Keep slashes (used in some headers), but otherwise strip punctuation.
+    s = re.sub(r"[^\w\s/]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def find_header_cells(grid: list[list[str]], header_text: str) -> list[tuple[int, int]]:
+    """Return all (row, col) 1-based header matches within a grid."""
+    want = _norm(header_text)
+    if not want or not grid:
+        return []
+    # Flexible matching strategy:
+    #   - exact match (after normalization)
+    #   - tolerate slash vs space
+    #   - allow trailing text (e.g., "... (pending)")
+    # This is intentionally more permissive because templates evolve.
+    want2 = want.replace("/", " ")
+    hits: list[tuple[int, int]] = []
+    R = len(grid)
+    C = max((len(r) for r in grid), default=0)
+    for r in range(R):
+        row = grid[r]
+        for c in range(min(C, len(row))):
+            v = row[c] if c < len(row) else ""
+            if not v:
+                continue
+            cell = _norm(str(v))
+            cell2 = cell.replace("/", " ")
+            if cell == want or cell2 == want2 or cell2.startswith(want2) or (want2 and want2 in cell2):
+                hits.append((r + 1, c + 1))
+    return hits
+
+
+def find_header_cell_best(grid: list[list[str]], header_text: str) -> tuple[int, int] | None:
+    """Return the "best" header match.
+
+    Many templates contain duplicate labels (e.g., once in a legend/footer).
+    The swap/callout sections are typically positioned to the *right* of the
+    schedule grid, so we prefer the rightmost match, breaking ties by choosing
+    the topmost.
+    """
+    hits = find_header_cells(grid, header_text)
+    if not hits:
+        return None
+    # Prefer rightmost (highest column), then topmost (lowest row).
+    return sorted(hits, key=lambda rc: (-rc[1], rc[0]))[0]
 
 
 @dataclass(frozen=True)
@@ -47,33 +97,17 @@ def read_top_grid(ws: gspread.Worksheet, *, max_rows: int = 250, max_cols: int =
     end_col_letter = a1.rowcol_to_a1(1, max_cols).split("1")[0]
     rng = f"A1:{end_col_letter}{max_rows}"
     try:
-        values = ws.get(rng)
+        return ws.get(rng) or []
     except Exception:
-        # Fallback: get_all_values can be heavier but may succeed.
-        values = ws.get_all_values()
-        values = values[:max_rows]
-        values = [row[:max_cols] for row in values]
-    return values or []
+        # Avoid ws.get_all_values(): it can be extremely heavy and may trigger
+        # Google Sheets read-quota (429) errors. If the bounded read fails,
+        # return empty and let the caller decide what to do.
+        return []
 
 
 def find_header_cell(grid: list[list[str]], header_text: str) -> tuple[int, int] | None:
-    """Return (row, col) 1-based for the first matching header cell."""
-    want = _norm(header_text)
-    if not want or not grid:
-        return None
-    # tolerate minor punctuation differences
-    want_re = re.compile(r"^" + re.escape(want).replace("/", r"[/ ]").replace(" ", r"\s*") + r"$", re.I)
-    R = len(grid)
-    C = max((len(r) for r in grid), default=0)
-    for r in range(R):
-        row = grid[r]
-        for c in range(min(C, len(row))):
-            v = row[c] if c < len(row) else ""
-            if not v:
-                continue
-            if want_re.match(_norm(str(v))):
-                return (r + 1, c + 1)
-    return None
+    """Return (row, col) 1-based for the best matching header cell."""
+    return find_header_cell_best(grid, header_text)
 
 
 def compute_section(header_row: int, header_col: int, *, max_rows: int = 200, num_cols: int = 8) -> Section:

@@ -20,6 +20,7 @@ from ..core import hours
 from ..core import labor_rules
 from ..core import schedule as schedule_mod
 from ..core import utils
+from ..core import week_range as week_range_mod
 from ..integrations.gspread_io import open_spreadsheet
 from ..services.audit_log import append_audit
 from ..services.approvals import read_requests as read_approval_requests
@@ -67,11 +68,37 @@ def _la_today() -> date:
 
 
 def _week_bounds_la(ref: date | None = None) -> tuple[date, date]:
-    """Return (monday, sunday) for the LA-local week containing ref."""
+    """Return (sunday, saturday) for the LA-local *calendar* week containing ref."""
     d = ref or _la_today()
-    monday = d - timedelta(days=d.weekday())
-    sunday = monday + timedelta(days=6)
-    return monday, sunday
+    # Python weekday(): Monday=0 ... Sunday=6.
+    # We want weeks that start on Sunday.
+    sunday = d - timedelta(days=(d.weekday() + 1) % 7)
+    saturday = sunday + timedelta(days=6)
+    return sunday, saturday
+
+
+def _worksheet_week_bounds(ss, campus_title: str) -> tuple[date, date] | None:
+    """Best-effort (week_start, week_end) for a worksheet.
+
+    For UNH/MC we infer from the sheet's visible header area.
+    For On-Call tabs, the title usually includes the week range.
+    """
+    try:
+        ws = ss.worksheet(campus_title)
+    except Exception:
+        return None
+    try:
+        return week_range_mod.week_range_from_worksheet(ws, today=_la_today())
+    except Exception:
+        return None
+
+
+def _date_for_weekday_in_sheet(ss, campus_title: str, day_canon: str) -> date | None:
+    wr = _worksheet_week_bounds(ss, campus_title)
+    if not wr:
+        return None
+    ws, we = wr
+    return week_range_mod.date_for_weekday(ws, we, day_canon)
 
 
 _DETAIL_KV_RE = re.compile(r"\b([a-z_]+)\s*=\s*([^|]+)", flags=re.I)
@@ -130,21 +157,26 @@ def _oncall_event_date(sheet_title: str, day_canon: str) -> date | None:
 
 
 def _oncall_week_start_from_title(sheet_title: str) -> date | None:
-    """Parse 'On Call 1/25 - 1/31' style titles to a LA-local week start date."""
-    s = str(sheet_title or "")
-    m = re.search(r"(\d{1,2})/(\d{1,2})\s*[-–]\s*(\d{1,2})/(\d{1,2})", s)
-    if not m:
-        return None
-    mm = int(m.group(1)); dd = int(m.group(2))
-    today = _la_today()
-    y = today.year
-    cand = date(y, mm, dd)
-    # Year rollover handling.
-    if cand < (today - timedelta(days=183)):
-        cand = date(y + 1, mm, dd)
-    elif cand > (today + timedelta(days=183)):
-        cand = date(y - 1, mm, dd)
-    return cand
+    """Infer the week start date for an On-Call tab.
+
+    Your templates use multiple title formats:
+      - "On Call 1/25 - 1/31" (slashes)
+      - "On Call 28 - 214" (compact M/D tokens; 28 => 2/8, 214 => 2/14)
+      - "On Call 928-104" (cross-month compact; 9/28 - 10/4)
+
+    We delegate parsing to oa_app.core.week_range which also handles year
+    rollover near Jan/Dec.
+    """
+    try:
+        from ..core import week_range as week_range_mod
+
+        today = _la_today()
+        wr = week_range_mod.week_range_from_title(str(sheet_title or ""), today=today)
+        if wr:
+            return wr[0]
+    except Exception:
+        pass
+    return None
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -568,20 +600,114 @@ def _week_token_from_title(title: str) -> str | None:
     return None
 
 
-def _resolve_week_titles(all_titles: list[str], seed_title: str) -> dict[str, str | None]:
-    """Find UNH/MC/ONCALL titles that match the same week token as seed_title."""
-    token = _week_token_from_title(seed_title)
+def _token_from_bounds(wr: tuple[date, date] | None) -> str | None:
+    """Convert (week_start, week_end) to a token like '1/25-1/31'."""
+    if not wr:
+        return None
+    try:
+        ws, we = wr
+        return f"{ws.month}/{ws.day}-{we.month}/{we.day}"
+    except Exception:
+        return None
+
+
+def _most_recent_title_by_week(cands: list[str]) -> str | None:
+    """Pick the most recent week-like title by parsing its week range.
+
+    IMPORTANT: We do **not** rely on spreadsheet tab order, because many
+    templates keep older weeks at the bottom or interleave non-week tabs.
+    """
+    if not cands:
+        return None
+    today = _la_today()
+    best_t = None
+    best_ws = None
+    for t in cands:
+        try:
+            wr = week_range_mod.week_range_from_title(t, today=today)
+        except Exception:
+            wr = None
+        if not wr:
+            continue
+        ws, _we = wr
+        if best_ws is None or ws > best_ws:
+            best_ws = ws
+            best_t = t
+    return best_t or cands[-1]
+
+
+def _resolve_week_titles(all_titles: list[str], seed_title: str, *, ss=None) -> dict[str, str | None]:
+    """Find UNH/MC/ONCALL titles that match the same week as `seed_title`.
+
+    We primarily match by a lightweight title token (e.g. '1/25-1/31'). If the
+    seed title does not contain a token (common for rolling tabs like
+    'UNH (OA and GOAs)'), we *infer* the token by scanning the worksheet header
+    for a week range.
+    """
+    today = _la_today()
+    # Prefer an actual week range (more reliable than token parsing).
+    seed_wr = None
+    try:
+        seed_wr = week_range_mod.week_range_from_title(seed_title, today=today)
+    except Exception:
+        seed_wr = None
+    if not seed_wr and ss is not None:
+        try:
+            seed_wr = _worksheet_week_bounds(ss, seed_title)
+        except Exception:
+            seed_wr = None
+
+    token = _week_token_from_title(seed_title) or _token_from_bounds(seed_wr)
+
+    seed_kind = campus_kind(seed_title)
 
     def _pick(kind: str) -> str | None:
         cands = [t for t in all_titles if campus_kind(t) == kind]
+        # On-Call General is not a week-specific sheet; never use it for week matching.
+        if kind == "ONCALL":
+            cands = [t for t in cands if "general" not in (t or "").lower()]
         if not cands:
             return None
+
+        # If the seed itself is of this kind, prefer it (it is the source tab).
+        if kind == seed_kind and seed_title in cands:
+            return seed_title
+
+        # Prefer exact week-range match across tabs.
+        if seed_wr:
+            for t in cands:
+                try:
+                    wr = week_range_mod.week_range_from_title(t, today=today)
+                except Exception:
+                    wr = None
+                if wr and wr == seed_wr:
+                    return t
+
+        # Fall back to lightweight title token match (works for M/D - M/D titles).
         if token:
             for t in cands:
                 if _week_token_from_title(t) == token:
                     return t
-        # Fallback to the most recent visible sheet for that kind.
-        return cands[-1]
+
+        # If this workbook uses rolling tabs (e.g., "MC (OA and GOAs)"), prefer them.
+        if kind in {"UNH", "MC"}:
+            rolling = []
+            for t in cands:
+                try:
+                    if not week_range_mod.week_range_from_title(t, today=today):
+                        rolling.append(t)
+                except Exception:
+                    rolling.append(t)
+            if rolling:
+                # Prefer the configured base title when present.
+                for pref in getattr(config, "OA_SCHEDULE_SHEETS", []) or []:
+                    for t in rolling:
+                        if t.strip().lower() == str(pref).strip().lower():
+                            return t
+                return rolling[0]
+
+        # Otherwise, pick the most recent week-like title (not tab order).
+        return _most_recent_title_by_week(cands)
 
     return {"UNH": _pick("UNH"), "MC": _pick("MC"), "ONCALL": _pick("ONCALL")}
 
@@ -1095,7 +1221,7 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                 # Load schedule for validations (include pending/approved pickups)
                 try:
                     epoch = st.session_state.get("UI_EPOCH", 0)
-                    week_titles_map = _resolve_week_titles(titles, sheet_title)
+                    week_titles_map = _resolve_week_titles(titles, sheet_title, ss=ss)
                     week_titles_set = {t for t in week_titles_map.values() if t}
 
                     base_sched = cached_user_schedule_for_titles(
@@ -1335,7 +1461,7 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
         # ------------------------------------------------------------------
         try:
             epoch = st.session_state.get("UI_EPOCH", 0)
-            week_titles_map = _resolve_week_titles(titles, w.campus_title)
+            week_titles_map = _resolve_week_titles(titles, w.campus_title, ss=ss)
             week_titles_set = {t for t in week_titles_map.values() if t}
 
             base_sched = cached_user_schedule_for_titles(
@@ -1695,21 +1821,20 @@ def run() -> None:
                 st.session_state["_LAST_HOURS"] = {"user": canon_tmp, "epoch": epoch_key, "hours": float(hours_now)}
 
                 # Sidebar hours widget:
-                # - Base scheduled hours come from Sheets (existing behavior).
-                # - If Supabase is configured, adjust with approved callouts/pickups.
+                # - The BIG number should match the schedule chart/table (raw scheduled hours from Sheets).
+                # - If Supabase is configured, we also show an *adjusted* total after approved callouts/pickups.
+                #   (Users found it confusing when the main number didn't match the schedule table.)
                 ws, we = _week_bounds_la()
+                scheduled_h = float(hours_now)
+                callout_h = pickup_h = 0.0
+                adjusted_h = scheduled_h
                 if callouts_db.supabase_callouts_enabled() and pickups_db.supabase_pickups_enabled():
                     adj = _cached_weekly_supabase_adjustments(canon_tmp, str(ws), str(we))
                     callout_h = float(adj.get("callout_hours", 0.0))
                     pickup_h = float(adj.get("pickup_hours", 0.0))
-                    general_h = max(0.0, float(hours_now) - callout_h)
-                    with_cover_h = max(0.0, general_h + pickup_h)
-                else:
-                    callout_h = pickup_h = 0.0
-                    general_h = float(hours_now)
-                    with_cover_h = float(hours_now)
+                    adjusted_h = max(0.0, scheduled_h - callout_h + pickup_h)
 
-                pct = min(max(with_cover_h / 20.0, 0.0), 1.0)
+                pct = min(max(scheduled_h / 20.0, 0.0), 1.0)
                 def _fmt_md(d: date) -> str:
                     try:
                         return d.strftime('%b %d').replace(' 0', ' ')
@@ -1724,10 +1849,11 @@ def run() -> None:
                         General hours <span class='oa-hours-card__scope'>(this week)</span>
                       </div>
                       <div class='oa-hours-card__valueBig'>
-                        {general_h:.1f} <span class='oa-hours-card__cap'>/ 20</span>
+                        {scheduled_h:.1f} <span class='oa-hours-card__cap'>/ 20</span>
                       </div>
                       <div class='oa-hours-card__subline'>
-                        Hours with cover: <b>{with_cover_h:.1f}</b>
+                        Adjusted (callouts/pickups): <b>{adjusted_h:.1f}</b>
+                        {'&nbsp;&nbsp;<span style="opacity:.75">(' + f"-{callout_h:.1f} callouts, +{pickup_h:.1f} pickups" + ')</span>' if (callout_h or pickup_h) else ''}
                       </div>
                       <div class='oa-hours-bar'>
                         <div class='oa-hours-bar__fill' style='width:{pct*100:.0f}%'></div>
@@ -1915,18 +2041,16 @@ def run() -> None:
                 st.rerun()
 
         # Admin-only manual sync for swap sections (rendered from Supabase).
-        # This does NOT run automatically on reruns.
-        try:
-            import os
-
-            admin_sync_enabled = str(os.getenv("ADMIN_SYNC", "")).strip().lower() in ("1", "true", "yes")
-            admin_sync_enabled = admin_sync_enabled or bool(st.secrets.get("ADMIN_SYNC", False))
-        except Exception:
-            admin_sync_enabled = False
-
-        if approver_mode and admin_sync_enabled:
+        # Shown in approver mode. This does NOT run automatically on reruns.
+        if approver_mode:
             with top_r:
                 st.caption("Admin")
+                try:
+                    from ..integrations.supabase_io import supabase_enabled
+
+                    st.caption("Supabase: ✅" if supabase_enabled() else "Supabase: ❌ (set SUPABASE_URL / SUPABASE_KEY in secrets)")
+                except Exception:
+                    pass
                 # Simple throttling to avoid accidental repeated clicks on reruns.
                 last = st.session_state.get("_LAST_SWAP_SYNC_TS")
                 now_ts = __import__("time").time()
@@ -1943,11 +2067,18 @@ def run() -> None:
                             sb = get_supabase()
                             res = sync_swaps_to_sheets(ss, sb)
                             st.session_state["_LAST_SWAP_SYNC_TS"] = now_ts
-                            st.success(
+                            sheet_errs = res.get("sheet_errors") or []
+                            msg = (
                                 f"Synced swaps. Weekly written: {res.get('weekly_written')} • "
                                 f"Future written: {res.get('future_written')} • "
                                 f"Sheets: {', '.join(res.get('sheets_updated', []) or [])}"
                             )
+                            if sheet_errs:
+                                msg += f" • Errors: {len(sheet_errs)}"
+                            st.success(msg)
+                            if sheet_errs:
+                                st.caption("First error:")
+                                st.code(str(sheet_errs[0]))
                         except Exception as e:
                             st.error(f"Swap sync failed: {str(e)}")
 
@@ -2035,45 +2166,63 @@ def run() -> None:
                     end=edt.time(),
                 )
             if action == "callout":
-                covered_by = None
-                m = re.search(r"\bcover\s*=\s*([^|]+)", details_rest, flags=re.I)
-                if m:
-                    covered_by = m.group(1).strip()
-                msg = chat_callout.handle_callout(
-                    st,
-                    ss,
-                    schedule_global,
-                    canon_target_name=requester,
-                    campus_title=campus_ws_title,
-                    day=day_canon,
-                    start=sdt.time(),
-                    end=edt.time(),
-                    covered_by=covered_by,
-                )
-                # After Sheets update succeeds, upsert into Supabase callouts table (idempotent).
+                # Per policy: callouts proceed directly and are always logged as "no cover".
+                # Coverage is represented by a separate PICKUP entry.
+
+                campus_key = utils.normalize_campus(campus_ws_title, campus)
+                kv = _parse_details_kv(details_rest)
+                reason = kv.get("reason")
+
+                # Event date derivation:
+                ds = (kv.get("date") or "").strip()
+                if ds:
+                    event_d = date.fromisoformat(ds)
+                elif campus_key in {"UNH", "MC"}:
+                    event_d = _date_for_weekday_in_sheet(ss, campus_ws_title, day_canon)
+                    if not event_d:
+                        ws0, _ = _week_bounds_la()
+                        want = utils.normalize_day(day_canon)
+                        event_d = ws0
+                        for i in range(7):
+                            cand = ws0 + timedelta(days=i)
+                            if utils.normalize_day(cand.strftime("%A")) == want:
+                                event_d = cand
+                                break
+                else:
+                    event_d = _oncall_event_date(campus_ws_title or meta.get("sheet_title", ""), day_canon)
+                    if not event_d:
+                        raise ValueError("Could not derive On-Call event date from sheet title")
+
+                # Only update schedule colors if the shift falls in the *current calendar week* (Sun–Sat, LA).
+                cw0, cw1 = _week_bounds_la()
+                in_current_week = bool(cw0 <= event_d <= cw1)
+
+                if in_current_week:
+                    msg = chat_callout.handle_callout(
+                        st,
+                        ss,
+                        schedule_global,
+                        canon_target_name=requester,
+                        campus_title=campus_ws_title,
+                        day=day_canon,
+                        start=sdt.time(),
+                        end=edt.time(),
+                        covered_by=None,
+                    )
+                else:
+                    msg = "Logged future callout (no schedule color change)."
+
+                # Upsert into Supabase callouts table (idempotent). Supabase is the source of truth.
+                start_at = _combine_date_time_la(event_d, sdt.time())
+                end_at = _combine_date_time_la(event_d, edt.time())
+                if end_at <= start_at:
+                    end_at = end_at + timedelta(days=1)
+
+                db_ok = False
                 try:
                     if callouts_db.supabase_callouts_enabled():
                         approval_id = str(req.get("ID", "")).strip()
                         created_at = _ensure_la_timestamptz(req.get("Created", ""))
-                        campus_key = utils.normalize_campus(campus_ws_title, campus)
-                        kv = _parse_details_kv(details_rest)
-                        reason = kv.get("reason")
-                        # Event date derivation:
-                        if campus_key in {"UNH", "MC"}:
-                            ds = kv.get("date", "").strip()
-                            if not ds:
-                                raise ValueError("Callout missing date=YYYY-MM-DD in Details")
-                            event_d = date.fromisoformat(ds)
-                        else:
-                            event_d = _oncall_event_date(campus_ws_title or meta.get("sheet_title", ""), day_canon)
-                            if not event_d:
-                                raise ValueError("Could not derive On-Call event date from sheet title")
-
-                        start_at = _combine_date_time_la(event_d, sdt.time())
-                        end_at = _combine_date_time_la(event_d, edt.time())
-                        if end_at <= start_at:
-                            end_at = end_at + timedelta(days=1)
-
                         callouts_db.upsert_callout(
                             {
                                 "approval_id": approval_id,
@@ -2086,6 +2235,7 @@ def run() -> None:
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
                             }
                         )
+                        db_ok = True
                 except Exception as e:
                     # Do not fail the approval if DB write fails.
                     try:
@@ -2102,6 +2252,38 @@ def run() -> None:
                     except Exception:
                         pass
                     st.warning(f"Sheets updated, but callout DB sync failed: {_strip_debug_blob(str(e))}")
+
+                # Render swap sections from Supabase (idempotent).
+                if db_ok:
+                    try:
+                        from ..integrations.supabase_io import get_supabase
+                        from ..jobs.sync_swaps_to_sheets import sync_swaps_to_sheets
+
+                        sb = get_supabase()
+                        # Sync only the worksheet the request was submitted from.
+                        # Swap-section sync is write-only and does not need to recolor the grid.
+                        # Grid colors are handled directly by the approve action to avoid Sheets read-quota (429).
+                        # Prefer the already-loaded worksheet object (avoids extra Sheets read calls).
+                        ws_obj = None
+                        try:
+                            if hasattr(schedule_global, "_load_ws_map"):
+                                schedule_global._load_ws_map()  # type: ignore[attr-defined]
+                                ws_obj = getattr(schedule_global, "_ws_map", {}).get(campus_ws_title)
+                        except Exception:
+                            ws_obj = None
+
+                        res = sync_swaps_to_sheets(
+                            ss,
+                            sb,
+                            worksheet=ws_obj,
+                            sheet_title=campus_ws_title,
+                            apply_grid_colors=False,
+                        )
+                        sheet_errs = res.get("sheet_errors") or []
+                        if sheet_errs:
+                            st.warning(f"Swap section sync had errors. First error: {sheet_errs[0]}")
+                    except Exception as e:
+                        st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
                 return msg
             if action == "pickup":
                 # A pickup request is a *cover* for someone else's callout.
@@ -2110,48 +2292,58 @@ def run() -> None:
                 if not m:
                     raise ValueError("Pickup request missing Details: target=<called-out OA>")
                 target = m.group(1).strip()
-                msg = chat_callout.handle_callout(
-                    st,
-                    ss,
-                    schedule_global,
-                    canon_target_name=target,
-                    campus_title=campus_ws_title,
-                    day=day_canon,
-                    start=sdt.time(),
-                    end=edt.time(),
-                    covered_by=requester,
-                )
+                campus_key = utils.normalize_campus(campus_ws_title, campus)
+                kv = _parse_details_kv(details_rest)
+
+                # Event date derivation:
+                ds = (kv.get("date") or "").strip()
+                if ds:
+                    event_d = date.fromisoformat(ds)
+                elif campus_key in {"UNH", "MC"}:
+                    event_d = _date_for_weekday_in_sheet(ss, campus_ws_title, day_canon)
+                    if not event_d:
+                        ws0, _ = _week_bounds_la()
+                        want = utils.normalize_day(day_canon)
+                        event_d = ws0
+                        for i in range(7):
+                            cand = ws0 + timedelta(days=i)
+                            if utils.normalize_day(cand.strftime("%A")) == want:
+                                event_d = cand
+                                break
+                else:
+                    event_d = _oncall_event_date(campus_ws_title or meta.get("sheet_title", ""), day_canon)
+                    if not event_d:
+                        raise ValueError("Could not derive On-Call event date from sheet title")
+
+                cw0, cw1 = _week_bounds_la()
+                in_current_week = bool(cw0 <= event_d <= cw1)
+
+                if in_current_week:
+                    msg = chat_callout.handle_callout(
+                        st,
+                        ss,
+                        schedule_global,
+                        canon_target_name=target,
+                        campus_title=campus_ws_title,
+                        day=day_canon,
+                        start=sdt.time(),
+                        end=edt.time(),
+                        covered_by=requester,
+                    )
+                else:
+                    msg = "Logged future pickup (no schedule color change)."
+
+                # Upsert into Supabase pickups table (idempotent). Supabase is the source of truth.
+                start_at = _combine_date_time_la(event_d, sdt.time())
+                end_at = _combine_date_time_la(event_d, edt.time())
+                if end_at <= start_at:
+                    end_at = end_at + timedelta(days=1)
+
+                db_ok = False
                 try:
                     if pickups_db.supabase_pickups_enabled():
                         approval_id = str(req.get("ID", "")).strip()
                         created_at = _ensure_la_timestamptz(req.get("Created", ""))
-                        campus_key = utils.normalize_campus(campus_ws_title, campus)
-                        kv = _parse_details_kv(details_rest)
-
-                        # Event date derivation:
-                        ds = kv.get("date", "").strip()
-                        if ds:
-                            event_d = date.fromisoformat(ds)
-                        elif campus_key in {"UNH", "MC"}:
-                            # UNH/MC pick-ups are assumed to occur in the current week.
-                            ws, _ = _week_bounds_la()
-                            want = utils.normalize_day(day_canon)
-                            event_d = ws
-                            for i in range(7):
-                                cand = ws + timedelta(days=i)
-                                if utils.normalize_day(cand.strftime("%A")) == want:
-                                    event_d = cand
-                                    break
-                        else:
-                            event_d = _oncall_event_date(campus_ws_title or meta.get("sheet_title", ""), day_canon)
-                            if not event_d:
-                                raise ValueError("Could not derive On-Call event date from sheet title")
-
-                        start_at = _combine_date_time_la(event_d, sdt.time())
-                        end_at = _combine_date_time_la(event_d, edt.time())
-                        if end_at <= start_at:
-                            end_at = end_at + timedelta(days=1)
-
                         pickups_db.upsert_pickup(
                             {
                                 "approval_id": approval_id,
@@ -2165,6 +2357,7 @@ def run() -> None:
                                 "note": kv.get("note"),
                             }
                         )
+                        db_ok = True
                 except Exception as e:
                     try:
                         append_audit(
@@ -2180,6 +2373,35 @@ def run() -> None:
                     except Exception:
                         pass
                     st.warning(f"Sheets updated, but pickup DB sync failed: {_strip_debug_blob(str(e))}")
+
+                # Render swap sections from Supabase (idempotent).
+                if db_ok:
+                    try:
+                        from ..integrations.supabase_io import get_supabase
+                        from ..jobs.sync_swaps_to_sheets import sync_swaps_to_sheets
+
+                        sb = get_supabase()
+                        # Prefer the already-loaded worksheet object (avoids extra Sheets read calls).
+                        ws_obj = None
+                        try:
+                            if hasattr(schedule_global, "_load_ws_map"):
+                                schedule_global._load_ws_map()  # type: ignore[attr-defined]
+                                ws_obj = getattr(schedule_global, "_ws_map", {}).get(campus_ws_title)
+                        except Exception:
+                            ws_obj = None
+
+                        res = sync_swaps_to_sheets(
+                            ss,
+                            sb,
+                            worksheet=ws_obj,
+                            sheet_title=campus_ws_title,
+                            apply_grid_colors=False,
+                        )
+                        sheet_errs = res.get("sheet_errors") or []
+                        if sheet_errs:
+                            st.warning(f"Swap section sync had errors. First error: {sheet_errs[0]}")
+                    except Exception as e:
+                        st.warning(f"Pickup recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
                 return msg
             raise ValueError(f"Unknown action: {action}")
 
@@ -2671,8 +2893,22 @@ def run() -> None:
         # Guided remove
         elif mode == "remove":
             st.markdown("### Remove shift — Guided")
+            # IMPORTANT: when a specific tab is selected in the sidebar, we must
+            # derive assignments from that same tab. (Especially for On-Call,
+            # where different weekly tabs can have different layouts.)
             try:
-                user_sched_all = cached_user_schedule(ss.id, canon_name, epoch_key)
+                base_titles = schedule_query._open_three(ss) or []  # UNH, MC, On-Call
+                unh_title = base_titles[0] if len(base_titles) >= 1 else None
+                mc_title = base_titles[1] if len(base_titles) >= 2 else None
+                oncall_title = active_tab if campus_kind(active_tab) == "ONCALL" else (base_titles[2] if len(base_titles) >= 3 else None)
+                user_sched_all = cached_user_schedule_for_titles(
+                    ss.id,
+                    canon_name,
+                    unh_title,
+                    mc_title,
+                    oncall_title,
+                    epoch_key,
+                )
             except Exception:
                 user_sched_all = {}
 
@@ -2821,8 +3057,22 @@ def run() -> None:
         # Guided callout
         elif mode == "callout":
             st.markdown("### Call-Out — Guided")
+            # IMPORTANT: the callout UI should reflect the *selected* roster tab.
+            # The default schedule resolver may pick a different weekly On-Call tab,
+            # which would make the dropdowns not match the sheet we write to.
             try:
-                user_sched_all = cached_user_schedule(ss.id, canon_name, epoch_key)
+                base_titles = schedule_query._open_three(ss) or []  # UNH, MC, On-Call
+                unh_title = base_titles[0] if len(base_titles) >= 1 else None
+                mc_title = base_titles[1] if len(base_titles) >= 2 else None
+                oncall_title = active_tab if campus_kind(active_tab) == "ONCALL" else (base_titles[2] if len(base_titles) >= 3 else None)
+                user_sched_all = cached_user_schedule_for_titles(
+                    ss.id,
+                    canon_name,
+                    unh_title,
+                    mc_title,
+                    oncall_title,
+                    epoch_key,
+                )
             except Exception:
                 user_sched_all = {}
 
@@ -2846,21 +3096,77 @@ def run() -> None:
                 sdt = datetime.strptime(s_str, "%I:%M %p")
                 edt = datetime.strptime(e_str, "%I:%M %p")
 
-                # UNH/MC callouts need an explicit calendar date (used for Supabase + reports).
+                # Support partial callouts (30-minute increments).
+                sdt0 = sdt
+                edt0 = edt
+                if edt0 <= sdt0:
+                    edt0 = edt0 + timedelta(days=1)
+                total_mins = int((edt0 - sdt0).total_seconds() // 60)
+
+                # Policy: On-Call callouts are always for the *entire* shift window.
+                if kind == "ONCALL":
+                    st.info("On-Call call-outs must be for the full shift.")
+                    duration_mins = total_mins
+                    callout_start = sdt0
+                    callout_end = edt0
+                else:
+                    st.markdown("**Step C — How much time are you calling out for?**")
+                    increments = [m for m in range(30, max(30, total_mins) + 1, 30)]
+                    if total_mins not in increments:
+                        # If the shift isn't on a 30-min grid, fall back to full shift only.
+                        increments = [total_mins]
+
+                    def _dur_label(m: int) -> str:
+                        if m == total_mins:
+                            if m < 60:
+                                return f"Full shift ({m}m)"
+                            h, r = divmod(m, 60)
+                            return f"Full shift ({h}h {r}m)" if r else f"Full shift ({h}h)"
+                        if m < 60:
+                            return f"{m}m"
+                        h, r = divmod(m, 60)
+                        if r:
+                            return f"{h}h {r}m"
+                        return f"{h}h"
+
+                    dur_labels = [_dur_label(m) for m in increments]
+                    dur_pick = st.selectbox("Duration", options=dur_labels, index=len(dur_labels) - 1)
+                    duration_mins = increments[dur_labels.index(dur_pick)]
+
+                    st.markdown("**Step D — When does your callout start?**")
+                    if duration_mins >= total_mins:
+                        callout_start = sdt0
+                    else:
+                        start_mode = st.radio(
+                            "Start time",
+                            options=["Start at shift start", "Pick a start time"],
+                            horizontal=True,
+                            key="callout.start_mode",
+                        )
+                        if start_mode == "Start at shift start":
+                            callout_start = sdt0
+                        else:
+                            latest = edt0 - timedelta(minutes=duration_mins)
+                            starts: list[datetime] = []
+                            t = sdt0
+                            while t <= latest:
+                                starts.append(t)
+                                t = t + timedelta(minutes=30)
+                            start_labels = [fmt_time(t) for t in starts]
+                            picked = st.selectbox("Start time (30-min steps)", options=start_labels, index=0)
+                            callout_start = starts[start_labels.index(picked)]
+
+                    callout_end = callout_start + timedelta(minutes=duration_mins)
+                    if callout_end > edt0:
+                        callout_end = edt0
+
+                # UNH/MC callouts: allow specifying the calendar date (used for logs/DB).
                 event_date = None
                 if kind in {"UNH", "MC"}:
-                    ws, we = _week_bounds_la()
-                    # Default to the day within this week that matches the selected weekday.
-                    default_d = ws
-                    try:
-                        want = utils.normalize_day(day_canon)
-                        for i in range(7):
-                            cand = ws + timedelta(days=i)
-                            if utils.normalize_day(cand.strftime("%A")) == want:
-                                default_d = cand
-                                break
-                    except Exception:
-                        default_d = _la_today()
+                    default_d = _date_for_weekday_in_sheet(ss, active_tab, day_canon)
+                    if not default_d:
+                        ws, _we = _week_bounds_la()
+                        default_d = ws
                     event_date = st.date_input("Date of shift", value=default_d, key="callout.date")
 
                 reason_opt = st.selectbox(
@@ -2874,62 +3180,91 @@ def run() -> None:
                     other_txt = st.text_input("If other, describe briefly", key="callout.reason_other")
                     reason = f"other:{other_txt.strip()}" if other_txt.strip() else "other"
 
-                have_cover = st.radio("Do you have coverage?", ["No", "Yes"], horizontal=True) == "Yes"
-                cover_name = st.text_input("Enter covering OA name (exact roster name)") if have_cover else ""
-
-                # Minimal UI change: allow submitting callouts for approval (especially for UNH/MC).
-                want_approval = st.checkbox(
-                    "Send for approval",
-                    value=True if kind in {"UNH", "MC"} else False,
-                    key="callout.want_approval",
-                )
-
+                # Per policy: callouts proceed directly and are always logged as "no cover".
                 if st.button("Apply Call-Out"):
                     try:
-                        details = "cover=" + cover_name if have_cover else "no cover"
+                        # Derive event date
+                        campus_key = ("ONCALL" if kind == "ONCALL" else kind)
+                        if kind in {"UNH", "MC"}:
+                            if not event_date:
+                                raise ValueError("Callout missing date. Please select a date for UNH/MC callouts.")
+                            event_d = event_date
+                        else:
+                            event_d = _oncall_event_date(active_tab, day_canon)
+                            if not event_d:
+                                raise ValueError("Could not derive On-Call event date from sheet title")
 
-                        # If submitting to approvals, store machine-parsable tokens.
-                        if want_approval:
-                            if kind in {"UNH", "MC"}:
-                                if not event_date:
-                                    raise ValueError("Callout missing date. Please select a date for UNH/MC callouts.")
-                                details_tokens = f"date={event_date.isoformat()} | reason={reason} | {details}"
-                            else:
-                                # On-Call event_date is derived on approval using META sheet_title + weekday.
-                                details_tokens = f"reason={reason} | {details}"
+                        # Update schedule colors only for shifts in the *current calendar week* (Sun–Sat, LA).
+                        cw0, cw1 = _week_bounds_la()
+                        in_current_week = bool(cw0 <= event_d <= cw1)
 
-                            rid = submit_approval_request(
+                        if in_current_week:
+                            msg = chat_callout.handle_callout(
+                                st,
                                 ss,
-                                requester=canon_name,
-                                action="callout",
-                                campus=("ONCALL" if kind == "ONCALL" else kind),
-                                day=day_canon.title(),
-                                start=fmt_time(sdt),
-                                end=fmt_time(edt),
-                                details=_attach_details_meta(
-                                    details=details_tokens,
-                                    campus_key=("ONCALL" if kind == "ONCALL" else kind),
-                                    sheet_title=active_tab,
-                                    sheet_gid=_sheet_gid_for_title(schedule_global, active_tab),
-                                ),
+                                schedule_global,
+                                canon_target_name=canon_name,
+                                campus_title=active_tab,
+                                day=day_canon,
+                                start=callout_start.time(),
+                                end=callout_end.time(),
+                                covered_by=None,
                             )
-                            st.session_state["mode"] = None
-                            st.session_state["sched_expanded"] = True
-                            _flash("success", f"🕓 Submitted for approval (id {rid}).")
-                            st.rerun()
+                        else:
+                            msg = "Logged future callout (no schedule color change)."
 
-                        # Direct apply (legacy behavior)
-                        msg = chat_callout.handle_callout(
-                            st,
-                            ss,
-                            schedule_global,
-                            canon_target_name=canon_name,
-                            campus_title=active_tab,
-                            day=day_canon,
-                            start=sdt.time(),
-                            end=edt.time(),
-                            covered_by=(cover_name.strip() if have_cover else None),
-                        )
+                        # Best-effort DB upsert + swap section render.
+                        start_at = _combine_date_time_la(event_d, callout_start.time())
+                        end_at = _combine_date_time_la(event_d, callout_end.time())
+                        if end_at <= start_at:
+                            end_at = end_at + timedelta(days=1)
+
+                        db_ok = False
+                        try:
+                            if callouts_db.supabase_callouts_enabled():
+                                approval_id = (
+                                    f"direct_callout|{campus_key}|{event_d.isoformat()}|"
+                                    f"{utils.name_key(canon_name)}|{callout_start.strftime('%H:%M')}|{callout_end.strftime('%H:%M')}"
+                                )
+                                callouts_db.upsert_callout(
+                                    {
+                                        "approval_id": approval_id,
+                                        "submitted_at": datetime.now(tz=ZoneInfo("America/Los_Angeles")).isoformat(timespec="seconds"),
+                                        "campus": campus_key,
+                                        "event_date": str(event_d),
+                                        "shift_start_at": start_at.isoformat(timespec="seconds"),
+                                        "shift_end_at": end_at.isoformat(timespec="seconds"),
+                                        "caller_name": canon_name,
+                                        "reason": reason,
+                                    }
+                                )
+                                db_ok = True
+                        except Exception as e:
+                            st.warning(f"Sheets updated, but callout DB sync failed: {_strip_debug_blob(str(e))}")
+
+                        if db_ok:
+                            try:
+                                from ..integrations.supabase_io import get_supabase
+                                from ..jobs.sync_swaps_to_sheets import sync_swaps_to_sheets
+
+                                sb = get_supabase()
+                                ws_obj = None
+                                try:
+                                    if hasattr(schedule_global, "_load_ws_map"):
+                                        schedule_global._load_ws_map()  # type: ignore[attr-defined]
+                                        ws_obj = getattr(schedule_global, "_ws_map", {}).get(active_tab)
+                                except Exception:
+                                    ws_obj = None
+
+                                sync_swaps_to_sheets(
+                                    ss,
+                                    sb,
+                                    worksheet=ws_obj,
+                                    sheet_title=active_tab,
+                                    apply_grid_colors=False,
+                                )
+                            except Exception as e:
+                                st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
 
                         try:
                             append_audit(
@@ -2938,9 +3273,9 @@ def run() -> None:
                                 action="callout",
                                 campus=active_tab,
                                 day=day_canon.title(),
-                                start=fmt_time(sdt),
-                                end=fmt_time(edt),
-                                details=f"{details} | reason={reason}",
+                                start=fmt_time(callout_start),
+                                end=fmt_time(callout_end),
+                                details=f"no cover | reason={reason}",
                             )
                         except Exception:
                             st.toast("Note: logging skipped due to quota.", icon="⚠️")
