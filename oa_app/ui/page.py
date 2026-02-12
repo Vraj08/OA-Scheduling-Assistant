@@ -345,29 +345,71 @@ def _pickup_windows_from_cached(rows: list[dict]) -> list[pickup_scan.PickupWind
     return uniq
 
 
-def _is_approver(canon_name: str) -> bool:
-    """Return True if this user should see the approvals UI.
+def _approver_identity_key(canon_name: str) -> str | None:
+    """Return the canonical approver identity key (name_key), or None.
 
-    We match loosely on name_key and also allow a "kat" prefix to cover
-    roster variants like "Kat ...".
+    Approver identity is intentionally *loose* to support roster variants and
+    short names.
     """
+
     nk = name_key(canon_name)
-    if nk == name_key("vraj patel"):
-        return True
-    # "kat" may appear as just "Kat" or "Kat <Last>" in the roster.
-    if nk == name_key("kat"):
-        return True
+
+    # Canonical identities
+    vraj = name_key("vraj patel")
+    kat = name_key("kat brosvik")
+    nile = name_key("nile bernal")
+    andy = name_key("barth andrew")
+    jaden = name_key("schutt jaden")
+
+    aliases = {
+        # Vraj
+        vraj: vraj,
+        # Kat (allow "Kat" prefix / roster variants)
+        kat: kat,
+        name_key("kat"): kat,
+        # Nile
+        nile: nile,
+        # Andy / Andrew Barth
+        andy: andy,
+        name_key("andrew barth"): andy,
+        name_key("andy"): andy,
+        # Jaden / Jaden Schutt
+        jaden: jaden,
+        name_key("jaden schutt"): jaden,
+        name_key("jaden"): jaden,
+    }
+
+    if nk in aliases:
+        return aliases[nk]
+
+    # Fallback: treat any "Kat ..." as Kat Brosvik for approver auth.
     if (canon_name or "").strip().lower().startswith("kat"):
-        return True
-    return False
+        return kat
+
+    return None
+
+
+def _is_approver(canon_name: str) -> bool:
+    """Return True if this user should see the approvals UI."""
+    ident = _approver_identity_key(canon_name)
+    if not ident:
+        return False
+    return ident in {
+        name_key("vraj patel"),
+        name_key("kat brosvik"),
+        name_key("nile bernal"),
+        name_key("barth andrew"),
+        name_key("schutt jaden"),
+    }
 
 
 def _approver_unlocked(canon_name: str) -> bool:
+    ident = _approver_identity_key(canon_name)
+    if not ident:
+        return False
     if not _is_approver(canon_name):
         return False
-    return bool(st.session_state.get("APPROVER_AUTH")) and st.session_state.get("APPROVER_AUTH_FOR") == name_key(
-        canon_name
-    )
+    return bool(st.session_state.get("APPROVER_AUTH")) and st.session_state.get("APPROVER_AUTH_FOR") == ident
 
 
 def _strip_debug_blob(msg: str) -> str:
@@ -1755,6 +1797,7 @@ def run() -> None:
         oa_name_input = st.text_input("Your full name (from hired OA list)", key="OA_NAME_INPUT")
 
         canon_name = None
+        approver_recognized = False
         if oa_name_input:
             # Exact (normalized) match
             canon_name = roster_canon_by_key.get(name_key(oa_name_input))
@@ -1778,6 +1821,24 @@ def run() -> None:
                 if best:
                     canon_name = roster_canon_by_key.get(best[0])
 
+            # Approver aliases (allow approver access even if not in roster)
+            if not canon_name:
+                try:
+                    ident = _approver_identity_key(oa_name_input)
+                except Exception:
+                    ident = None
+                if ident:
+                    # Map identity key -> canonical display name used throughout the app
+                    display_by_ident = {
+                        name_key("vraj patel"): "Vraj Patel",
+                        name_key("kat brosvik"): "Kat Brosvik",
+                        name_key("nile bernal"): "Nile Bernal",
+                        name_key("barth andrew"): "Barth Andrew",
+                        name_key("schutt jaden"): "Schutt Jaden",
+                    }
+                    canon_name = display_by_ident.get(ident)
+                    approver_recognized = True
+
         # If still not found, show a clear message (no extra dropdown)
         if oa_name_input and not canon_name:
             if not roster:
@@ -1796,6 +1857,11 @@ def run() -> None:
                             st.write(f"• {roster_canon_by_key.get(k)}")
                 except Exception:
                     pass
+
+        # If we recognized an approver alias that is not in the hired OA roster,
+        # give a helpful hint so users understand why their schedule may be blank.
+        if oa_name_input and approver_recognized and canon_name and name_key(oa_name_input) not in roster_canon_by_key:
+            st.caption("✅ Approver recognized (not in hired OA roster). You can unlock approver mode to review requests. Your schedule/hours may show as 0 if you're not on the roster.")
 
         if canon_name:
             try:
@@ -1886,7 +1952,7 @@ def run() -> None:
                 except Exception:
                     pass
 
-                # Approver unlock (Vraj/Kat only)
+                # Approver unlock (name-based allowlist)
                 if _is_approver(canon_tmp):
                     if _approver_unlocked(canon_tmp):
                         st.success("Approver mode unlocked")
@@ -1898,10 +1964,30 @@ def run() -> None:
                         st.warning("Approver mode locked — enter password")
                         pw = st.text_input("Approver password", type="password", key="APPROVER_PW")
                         if st.button("Unlock", key="btn_unlock_approver"):
-                            expected = str(st.secrets.get("APPROVER_PASSWORD", "")).strip()
-                            if expected and pw == expected:
+                            ident = _approver_identity_key(canon_tmp)
+                            expected_global = str(st.secrets.get("APPROVER_PASSWORD", "")).strip()
+
+                            # Temporary per-approver passwords (requested).
+                            per_password = {
+                                name_key("kat brosvik"): "change-me",
+                                name_key("nile bernal"): "change-me",
+                                name_key("barth andrew"): "change-me",
+                                name_key("schutt jaden"): "change-me",
+                            }
+
+                            ok = False
+                            if expected_global and pw == expected_global:
+                                ok = True
+                            elif ident and pw and pw == per_password.get(ident, ""):
+                                ok = True
+                            elif (not expected_global) and pw == "change-me":
+                                # If no global password is configured, default to "change-me"
+                                # for all approvers so local dev works out-of-the-box.
+                                ok = True
+
+                            if ok and ident:
                                 st.session_state["APPROVER_AUTH"] = True
-                                st.session_state["APPROVER_AUTH_FOR"] = name_key(canon_tmp)
+                                st.session_state["APPROVER_AUTH_FOR"] = ident
                                 st.session_state.pop("APPROVER_PW", None)
                                 st.rerun()
                             else:
