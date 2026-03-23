@@ -2279,11 +2279,14 @@ def run() -> None:
                     if not event_d:
                         raise ValueError("Could not derive On-Call event date from sheet title")
 
-                # Only update schedule colors if the shift falls in the *current calendar week* (Sun–Sat, LA).
+                # Keep the existing current-week rule for MC/UNH, but allow On-Call
+                # callouts to mark their schedule cells red even when the shift is in
+                # a future week tab.
                 cw0, cw1 = _week_bounds_la()
                 in_current_week = bool(cw0 <= event_d <= cw1)
+                should_color_now = bool(in_current_week or campus_key == "ONCALL")
 
-                if in_current_week:
+                if should_color_now:
                     msg = chat_callout.handle_callout(
                         st,
                         ss,
@@ -3280,11 +3283,14 @@ def run() -> None:
                             if not event_d:
                                 raise ValueError("Could not derive On-Call event date from sheet title")
 
-                        # Update schedule colors only for shifts in the *current calendar week* (Sun–Sat, LA).
+                        # Keep the existing current-week rule for MC/UNH, but allow
+                        # On-Call callouts to mark their schedule cells red even when
+                        # the shift is in a future week tab.
                         cw0, cw1 = _week_bounds_la()
                         in_current_week = bool(cw0 <= event_d <= cw1)
+                        should_color_now = bool(in_current_week or campus_key == "ONCALL")
 
-                        if in_current_week:
+                        if should_color_now:
                             msg = chat_callout.handle_callout(
                                 st,
                                 ss,
