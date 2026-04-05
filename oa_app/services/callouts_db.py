@@ -35,27 +35,33 @@ def upsert_callout(payload: dict) -> dict:
     return data[0] if data else {}
 
 
-def sum_callout_hours_for_week(*, caller_name: str, week_start: date, week_end: date) -> float:
-    """Sum duration_hours for a caller within [week_start, week_end] (inclusive)."""
+def list_callouts_for_week(*, caller_name: str, week_start: date, week_end: date) -> list[dict[str, Any]]:
+    """Return current-week callout rows for one caller (best-effort)."""
     if not supabase_callouts_enabled():
-        return 0.0
+        return []
     sb = get_supabase()
-    # Use canonical display name match, but tolerate minor spacing/case by normalizing
-    # on the Python side (we store canon roster names in DB).
     caller = (caller_name or "").strip()
     resp = with_retry(
         lambda: sb.table("callouts")
-        .select("duration_hours,caller_name")
+        .select("event_date,duration_hours,caller_name")
         .gte("event_date", str(week_start))
         .lte("event_date", str(week_end))
         .execute()
     )
     rows: list[dict[str, Any]] = getattr(resp, "data", None) or []
     target_k = name_key(caller)
-    total = 0.0
+    out: list[dict[str, Any]] = []
     for r in rows:
         if name_key(str(r.get("caller_name", ""))) != target_k:
             continue
+        out.append(r)
+    return out
+
+
+def sum_callout_hours_for_week(*, caller_name: str, week_start: date, week_end: date) -> float:
+    """Sum duration_hours for a caller within [week_start, week_end] (inclusive)."""
+    total = 0.0
+    for r in list_callouts_for_week(caller_name=caller_name, week_start=week_start, week_end=week_end):
         try:
             total += float(r.get("duration_hours") or 0.0)
         except Exception:

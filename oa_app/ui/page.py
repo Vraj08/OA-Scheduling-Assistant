@@ -772,8 +772,14 @@ def _append_my_pickups_into_sched(
     requester: str,
     week_titles: set[str],
     include_statuses: set[str] | None = None,
+    ss=None,
+    week_bounds: tuple[date, date] | None = None,
 ) -> dict:
-    """Overlay this requester's pickup requests (pending/approved) into the schedule dict."""
+    """Overlay this requester's pickup requests into the schedule dict.
+
+    `week_bounds` is the authoritative week filter when available. This avoids
+    pulling old pickup requests from prior weeks on rolling UNH/MC tabs.
+    """
     include_statuses = include_statuses or {"PENDING", "APPROVED"}
     out = {d: {k: list(v) for k, v in (buckets or {}).items()} for d, buckets in (user_sched_all or {}).items()}
     for d in out.values():
@@ -794,6 +800,10 @@ def _append_my_pickups_into_sched(
         meta, _rest = _extract_details_meta(str(r.get("Details", "") or ""))
         campus_title = str(meta.get("sheet_title") or "").strip() or campus
         if week_titles and campus_title not in week_titles:
+            continue
+
+        event_d = _approval_row_event_date(ss, r) if ss is not None else None
+        if week_bounds and event_d and not (week_bounds[0] <= event_d <= week_bounds[1]):
             continue
 
         day_raw = str(r.get("Day", "") or "")
@@ -832,6 +842,210 @@ def _sum_minutes_sched(user_sched_all: dict) -> tuple[int, dict[str, int]]:
         day_totals[day_canon] = mins
         week_total += mins
     return week_total, day_totals
+
+
+def _minutes_from_hours(value) -> int:
+    try:
+        return int(round(float(value or 0.0) * 60.0))
+    except Exception:
+        return 0
+
+
+def _request_week_bounds(ss, week_titles_map: dict[str, str | None], seed_title: str) -> tuple[date, date]:
+    """Best-effort week bounds for the pickup being validated."""
+    for cand in [seed_title, week_titles_map.get("ONCALL"), week_titles_map.get("UNH"), week_titles_map.get("MC")]:
+        if not cand:
+            continue
+        try:
+            wr = week_range_mod.week_range_from_title(str(cand), today=_la_today())
+        except Exception:
+            wr = None
+        if not wr:
+            try:
+                wr = _worksheet_week_bounds(ss, str(cand))
+            except Exception:
+                wr = None
+        if wr:
+            return wr
+    return _week_bounds_la()
+
+
+def _approval_created_week_fallback(req: dict, day_canon: str) -> date | None:
+    s = str(req.get("Created", "") or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+        dt_la = dt.astimezone(ZoneInfo("America/Los_Angeles"))
+        ws, we = _week_bounds_la(dt_la.date())
+        return week_range_mod.date_for_weekday(ws, we, day_canon)
+    except Exception:
+        return None
+
+
+def _approval_row_event_date(ss, req: dict) -> date | None:
+    """Best-effort event date for an approval row.
+
+    Used to keep validation week math from counting old requests that happen to
+    share the same rolling sheet title.
+    """
+    details = str(req.get("Details", "") or "")
+    meta, details_rest = _extract_details_meta(details)
+    kv = _parse_details_kv(details_rest)
+    ds = (kv.get("date") or "").strip()
+    if ds:
+        try:
+            return date.fromisoformat(ds)
+        except Exception:
+            pass
+
+    day_raw = str(req.get("Day", "") or "")
+    day_canon = re.sub(r"[^a-z]", "", day_raw.strip().lower())
+    if not day_canon:
+        return None
+
+    campus = str(req.get("Campus", "") or "").strip()
+    campus_title = str(meta.get("sheet_title") or "").strip() or campus
+    campus_key = str(meta.get("campus_key") or "").strip().upper()
+    if not campus_key:
+        campus_kind_guess = campus_kind(campus_title or campus)
+        campus_key = "ONCALL" if campus_kind_guess == "ONCALL" else str(campus_kind_guess or campus).upper()
+
+    if ss is not None and campus_key in {"UNH", "MC"} and campus_title:
+        try:
+            d = _date_for_weekday_in_sheet(ss, campus_title, day_canon)
+            if d:
+                return d
+        except Exception:
+            pass
+
+    if campus_key == "ONCALL" and campus_title:
+        try:
+            d = _oncall_event_date(campus_title, day_canon)
+            if d:
+                return d
+        except Exception:
+            pass
+
+    return _approval_created_week_fallback(req, day_canon)
+
+
+def _pending_pickup_minutes_for_week(
+    ss,
+    approvals_rows: list[dict],
+    *,
+    requester: str,
+    week_bounds: tuple[date, date],
+) -> tuple[int, dict[str, int]]:
+    """Pending pickup minutes for one requester inside the validation week."""
+    want_req = name_key(requester)
+    week_total = 0
+    per_day: dict[str, int] = {}
+    ws, we = week_bounds
+
+    for r in approvals_rows or []:
+        if str(r.get("Action", "") or "").strip().lower() != "pickup":
+            continue
+        if str(r.get("Status", "") or "").strip().upper() != "PENDING":
+            continue
+        if name_key(str(r.get("Requester", "") or "")) != want_req:
+            continue
+
+        event_d = _approval_row_event_date(ss, r)
+        if not event_d or not (ws <= event_d <= we):
+            continue
+
+        try:
+            sd = _parse_12h_time(str(r.get("Start", "") or ""))
+            ed = _parse_12h_time(str(r.get("End", "") or ""))
+        except Exception:
+            continue
+        if ed <= sd:
+            ed = ed + timedelta(days=1)
+        mins = int((ed - sd).total_seconds() // 60)
+        day_canon = utils.normalize_day(event_d.strftime("%A")) or re.sub(r"[^a-z]", "", str(r.get("Day", "") or "").strip().lower())
+        week_total += mins
+        per_day[day_canon] = int(per_day.get(day_canon, 0)) + mins
+
+    return week_total, per_day
+
+
+def _approved_adjustment_minutes_for_week(
+    requester: str,
+    week_bounds: tuple[date, date],
+) -> tuple[int, dict[str, int], int, dict[str, int]]:
+    """Return approved pickup and callout minutes for one requester/week."""
+    ws, we = week_bounds
+    pickup_week = 0
+    callout_week = 0
+    pickup_day: dict[str, int] = {}
+    callout_day: dict[str, int] = {}
+
+    try:
+        for row in pickups_db.list_pickups_for_week(picker_name=requester, week_start=ws, week_end=we):
+            try:
+                event_d = date.fromisoformat(str(row.get("event_date")))
+            except Exception:
+                continue
+            mins = _minutes_from_hours(row.get("duration_hours"))
+            day_canon = utils.normalize_day(event_d.strftime("%A"))
+            pickup_week += mins
+            pickup_day[day_canon] = int(pickup_day.get(day_canon, 0)) + mins
+    except Exception:
+        pass
+
+    try:
+        for row in callouts_db.list_callouts_for_week(caller_name=requester, week_start=ws, week_end=we):
+            try:
+                event_d = date.fromisoformat(str(row.get("event_date")))
+            except Exception:
+                continue
+            mins = _minutes_from_hours(row.get("duration_hours"))
+            day_canon = utils.normalize_day(event_d.strftime("%A"))
+            callout_week += mins
+            callout_day[day_canon] = int(callout_day.get(day_canon, 0)) + mins
+    except Exception:
+        pass
+
+    return pickup_week, pickup_day, callout_week, callout_day
+
+
+def _overtime_baseline_minutes(
+    ss,
+    *,
+    requester: str,
+    base_sched: dict,
+    approvals_rows: list[dict],
+    week_bounds: tuple[date, date],
+) -> tuple[int, dict[str, int]]:
+    """Accurate pre-request minutes for overtime checks.
+
+    Baseline = raw scheduled minutes for the request week
+               - approved callouts for that same week
+               + approved pickups for that same week
+               + pending pickup requests for that same week.
+    """
+    week_before_mins, per_day_before = _sum_minutes_sched(base_sched)
+
+    if callouts_db.supabase_callouts_enabled() and pickups_db.supabase_pickups_enabled():
+        pickup_week, pickup_day, callout_week, callout_day = _approved_adjustment_minutes_for_week(
+            requester,
+            week_bounds,
+        )
+        week_before_mins = max(0, week_before_mins - callout_week + pickup_week)
+        for d in list(per_day_before.keys()):
+            per_day_before[d] = max(0, int(per_day_before.get(d, 0)) - int(callout_day.get(d, 0)) + int(pickup_day.get(d, 0)))
+
+    pending_week, pending_day = _pending_pickup_minutes_for_week(
+        ss, approvals_rows, requester=requester, week_bounds=week_bounds
+    )
+    week_before_mins += pending_week
+    for d, mins in pending_day.items():
+        per_day_before[d] = int(per_day_before.get(d, 0)) + int(mins)
+
+    return week_before_mins, per_day_before
 
 
 def _day_intervals(user_sched_all: dict, day_canon: str) -> list[tuple[datetime, datetime]]:
@@ -1261,6 +1475,9 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                 st.write(f"**Request:** {target} — {day_canon.title()} {fmt_time(req_s)}–{fmt_time(req_e)}")
 
                 # Load schedule for validations (include pending/approved pickups)
+                base_sched = {}
+                appr_rows = []
+                request_week_bounds = _week_bounds_la()
                 try:
                     epoch = st.session_state.get("UI_EPOCH", 0)
                     week_titles_map = _resolve_week_titles(titles, sheet_title, ss=ss)
@@ -1278,12 +1495,15 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                     ver_map = st.session_state.get("WS_VER", {}) or {}
                     appr_epoch = int(ver_map.get(config.APPROVAL_SHEET, 0))
                     appr_rows = cached_approval_table(ss.id, appr_epoch, max_rows=500)
+                    request_week_bounds = _request_week_bounds(ss, week_titles_map, sheet_title)
                     user_sched_all = _append_my_pickups_into_sched(
                         base_sched,
                         appr_rows,
                         requester=canon_user,
                         week_titles=week_titles_set,
                         include_statuses={"PENDING", "APPROVED"},
+                        ss=ss,
+                        week_bounds=request_week_bounds,
                     )
                 except Exception as e:
                     # If approvals fetch failed due to network/quota, show the recovery popup.
@@ -1291,6 +1511,7 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                         return
                     # Otherwise, fall back to a direct schedule read (still allows basic conflict checks).
                     user_sched_all = schedule_query.get_user_schedule(ss, schedule_global, canon_user)
+                    base_sched = user_sched_all
 
                 bucket = "On-Call" if kind == "ONCALL" else kind
                 conflict_msg = _find_any_conflict(user_sched_all, day_canon, bucket, req_s, req_e)
@@ -1341,7 +1562,13 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                             st.rerun()
 
                 # Hours caps with overtime prompt (popup)
-                week_before_mins, per_day_before = _sum_minutes_sched(user_sched_all)
+                week_before_mins, per_day_before = _overtime_baseline_minutes(
+                    ss,
+                    requester=canon_user,
+                    base_sched=base_sched,
+                    approvals_rows=appr_rows,
+                    week_bounds=request_week_bounds,
+                )
                 req_mins = labor_rules.minutes_between(req_s, req_e)
                 day_before_mins = int(per_day_before.get(day_canon, 0))
                 week_after_mins = int(week_before_mins) + int(req_mins)
@@ -1381,7 +1608,10 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                             st.error("Please fix the issues above before submitting.")
                             return
                         try:
+                            event_d = (_date_for_weekday_in_sheet(ss, sheet_title, day_canon) if kind in {"UNH", "MC"} else _oncall_event_date(sheet_title, day_canon))
                             details = f"target={target}"
+                            if event_d:
+                                details += f" | date={event_d.isoformat()}"
                             if overtime_needed:
                                 details += f" | overtime: yes | week_after={week_after_mins/60:.2f} | day_after={day_after_mins/60:.2f}"
                             campus_key = ("ONCALL" if kind == "ONCALL" else kind)
@@ -1501,6 +1731,9 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
         # We compute these *before* submission so the user can see why it would
         # be blocked, and (when possible) choose a suggested alternative.
         # ------------------------------------------------------------------
+        base_sched = {}
+        appr_rows = []
+        request_week_bounds = _week_bounds_la()
         try:
             epoch = st.session_state.get("UI_EPOCH", 0)
             week_titles_map = _resolve_week_titles(titles, w.campus_title, ss=ss)
@@ -1518,18 +1751,22 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
             ver_map = st.session_state.get("WS_VER", {}) or {}
             appr_epoch = int(ver_map.get(config.APPROVAL_SHEET, 0))
             appr_rows = cached_approval_table(ss.id, appr_epoch, max_rows=500)
+            request_week_bounds = _request_week_bounds(ss, week_titles_map, w.campus_title)
             user_sched_all = _append_my_pickups_into_sched(
                 base_sched,
                 appr_rows,
                 requester=canon_user,
                 week_titles=week_titles_set,
                 include_statuses={"PENDING", "APPROVED"},
+                ss=ss,
+                week_bounds=request_week_bounds,
             )
         except Exception as e:
             if maybe_show_recovery_popup(e, where="loading approvals for labor-rule checks"):
                 return
             # Fallback: still allow submission with at least overlap checks.
             user_sched_all = schedule_query.get_user_schedule(ss, schedule_global, canon_user)
+            base_sched = user_sched_all
 
         # Break rule check (5h continuous => need a 30m break)
         min_pickup_mins = 30 if w.kind in {"UNH", "MC"} else 0
@@ -1595,7 +1832,13 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                 st.rerun()
 
         # Hours caps (20h/week, 8h/day) — allow overtime *request* to approvers.
-        week_before_mins, per_day_before = _sum_minutes_sched(user_sched_all)
+        week_before_mins, per_day_before = _overtime_baseline_minutes(
+            ss,
+            requester=canon_user,
+            base_sched=base_sched,
+            approvals_rows=appr_rows,
+            week_bounds=request_week_bounds,
+        )
         req_mins = labor_rules.minutes_between(req_s, req_e)
         day_before_mins = int(per_day_before.get(w.day_canon, 0))
         week_after_mins = int(week_before_mins) + int(req_mins)
@@ -1653,7 +1896,10 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                     st.error("This exceeds daily/weekly caps. Select **Yes** to request overtime approval, or shorten the pickup.")
                     return
 
+                event_d = (_date_for_weekday_in_sheet(ss, w.campus_title, w.day_canon) if w.kind in {"UNH", "MC"} else _oncall_event_date(w.campus_title, w.day_canon))
                 details = f"target={w.target_name}"
+                if event_d:
+                    details += f" | date={event_d.isoformat()}"
                 if overtime_needed:
                     details += (
                         f" | overtime: yes"
