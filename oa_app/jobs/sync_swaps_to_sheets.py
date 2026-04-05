@@ -157,6 +157,28 @@ def _key_hash(s: str) -> str:
     return sha1(s.encode("utf-8")).hexdigest()[:12]
 
 
+def _infer_visible_row_date(text: str, *, today: date) -> date | None:
+    """Best-effort parse of a swap/callout row date from visible text.
+
+    Used to clean legacy rows that predate the current LA-local date, even when
+    those rows were created before metadata keys were introduced.
+    """
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})\b", str(text or ""))
+    if not m:
+        return None
+    mm = int(m.group(1))
+    dd = int(m.group(2))
+    candidates: list[date] = []
+    for yy in (today.year - 1, today.year, today.year + 1):
+        try:
+            candidates.append(date(yy, mm, dd))
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    return min(candidates, key=lambda d: abs((d - today).days))
+
+
 def _stable_key(parts: list[str]) -> str:
     def n(x: str) -> str:
         return " ".join((x or "").strip().lower().split())
@@ -415,6 +437,7 @@ def _upsert_section(
     *,
     key_col: int,
     base_bg: dict,
+    clear_past_before: date | None = None,
 ) -> int:
     """Upsert rows into a section without clearing existing manual content.
 
@@ -424,6 +447,8 @@ def _upsert_section(
       without overwriting manual entries.
     - Clears only rows that are managed by the system (those that have a key) but are no
       longer present in the desired set (week rollover / interval changes).
+    - Optionally clears legacy visible rows whose rendered event date is before
+      clear_past_before, even if they do not have a metadata key yet.
     """
     start_r = section.start_row
     end_r = section.start_row + section.max_rows - 1
@@ -453,6 +478,28 @@ def _upsert_section(
     vis_vals = _col_list(vis_vals_raw)
     key_vals = _col_list(key_vals_raw)
 
+    value_updates: list[dict] = []
+    fmt_rows: list[int] = []
+    fmt_colors: list[dict] = []
+
+    def _cell_a1(r: int, c: int) -> str:
+        return f"{_col_letter(c)}{r}"
+
+    # Upgrade cleanup: remove past-dated visible rows, including legacy rows
+    # that were written before metadata keys existed.
+    if clear_past_before is not None:
+        for i, txt in enumerate(vis_vals):
+            parsed = _infer_visible_row_date(txt, today=clear_past_before)
+            if parsed is None or parsed >= clear_past_before:
+                continue
+            rownum = start_r + i
+            value_updates.append({'range': _sheet_a1(ws.title, _cell_a1(rownum, vis_col)), 'values': [['']]})
+            value_updates.append({'range': _sheet_a1(ws.title, _cell_a1(rownum, key_col)), 'values': [['']]})
+            fmt_rows.append(rownum)
+            fmt_colors.append(base_bg)
+            vis_vals[i] = ''
+            key_vals[i] = ''
+
     key_to_row: dict[str, int] = {}
     for i, k in enumerate(key_vals):
         kk = (k or '').strip()
@@ -461,13 +508,6 @@ def _upsert_section(
 
     desired_keys = [r.oa_key for r in rows if (r.oa_key or '').strip()]
     desired_set = set(desired_keys)
-
-    value_updates: list[dict] = []
-    fmt_rows: list[int] = []
-    fmt_colors: list[dict] = []
-
-    def _cell_a1(r: int, c: int) -> str:
-        return f"{_col_letter(c)}{r}"
 
     # Clear managed rows not in desired set.
     # IMPORTANT: keep the section's base background color when clearing.
@@ -769,13 +809,15 @@ def sync_swaps_to_sheets(
     if not targets:
         raise ValueError("No schedule worksheets found to sync swaps into.")
 
-    # Query Supabase once, starting at the current week start (includes current + future).
-    callouts_all = _query_all_from(supabase, "callouts", start_date=cw0)
-    pickups_all = _query_all_from(supabase, "pickups", start_date=cw0)
+    # Query Supabase once, starting at today. This keeps the rendered sections
+    # focused on live and upcoming events and prevents past entries from being
+    # re-rendered midweek.
+    callouts_all = _query_all_from(supabase, "callouts", start_date=today)
+    pickups_all = _query_all_from(supabase, "pickups", start_date=today)
 
     summary: dict[str, Any] = {
         "calendar_week": {"start": cw0.isoformat(), "end": cw1.isoformat()},
-        "min_event_date": cw0.isoformat(),
+        "min_event_date": today.isoformat(),
         "sheets_updated": [],
         "sheet_errors": [],
         "weekly_written": 0,
@@ -866,6 +908,7 @@ def sync_swaps_to_sheets(
                     weekly_out,
                     key_col=KEY_WEEKLY_COL,
                     base_bg=SWAP_WEEKLY_BG,
+                    clear_past_before=today,
                 )
                 summary["weekly_written"] += n1
                 wrote_any = True
@@ -876,6 +919,7 @@ def sync_swaps_to_sheets(
                     future_out,
                     key_col=KEY_FUTURE_COL,
                     base_bg=SWAP_FUTURE_BG,
+                    clear_past_before=today,
                 )
                 summary["future_written"] += n2
                 wrote_any = True
