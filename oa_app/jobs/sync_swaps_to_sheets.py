@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time
 from hashlib import sha1
-from typing import Any
+from typing import Any, Callable
 
 from zoneinfo import ZoneInfo
 import re
@@ -31,7 +31,7 @@ import gspread
 
 from ..integrations.gspread_io import with_backoff
 from ..core.sheets_sections import Section, blanks, compute_section, pad_rows
-from ..core.week_range import la_today
+from ..core.week_range import la_today, week_range_from_title
 from ..core import utils
 
 
@@ -438,6 +438,7 @@ def _upsert_section(
     key_col: int,
     base_bg: dict,
     clear_past_before: date | None = None,
+    clear_visible_row_when: Callable[[str], bool] | None = None,
 ) -> int:
     """Upsert rows into a section without clearing existing manual content.
 
@@ -487,10 +488,19 @@ def _upsert_section(
 
     # Upgrade cleanup: remove past-dated visible rows, including legacy rows
     # that were written before metadata keys existed.
-    if clear_past_before is not None:
+    if clear_past_before is not None or clear_visible_row_when is not None:
         for i, txt in enumerate(vis_vals):
-            parsed = _infer_visible_row_date(txt, today=clear_past_before)
-            if parsed is None or parsed >= clear_past_before:
+            txt_s = str(txt or "")
+            clear_row = False
+            if clear_visible_row_when is not None:
+                try:
+                    clear_row = bool(clear_visible_row_when(txt_s))
+                except Exception:
+                    clear_row = False
+            if not clear_row and clear_past_before is not None:
+                parsed = _infer_visible_row_date(txt_s, today=clear_past_before)
+                clear_row = bool(parsed is not None and parsed < clear_past_before)
+            if not clear_row:
                 continue
             rownum = start_r + i
             value_updates.append({'range': _sheet_a1(ws.title, _cell_a1(rownum, vis_col)), 'values': [['']]})
@@ -605,6 +615,60 @@ def _campus_key_for_sheet_title(title: str) -> str:
     if re.search(r"\bon\s*[- ]?\s*call\b", tl) or "oncall" in tl:
         return "ONCALL"
     return utils.normalize_campus(title, "UNH")
+
+
+def _worksheet_is_hidden(ws: gspread.Worksheet) -> bool:
+    try:
+        return bool(getattr(ws, "_properties", {}).get("hidden", False))
+    except Exception:
+        return False
+
+
+def _should_auto_sync_worksheet(ws: gspread.Worksheet) -> bool:
+    """Manual/global sync should only touch visible schedule worksheets."""
+    if _worksheet_is_hidden(ws):
+        return False
+    tl = (getattr(ws, "title", "") or "").strip().lower()
+    if tl in {"(names of hired oas)", "eo schedule policies", "audit log", "_locks"}:
+        return False
+    return bool("(oa and goas)" in tl or re.search(r"\bon\s*[- ]?call\b", tl))
+
+
+def _bucket_window_for_sheet(title: str, *, today: date) -> tuple[date, date, bool]:
+    """Return (bucket_start, bucket_end, allow_future_column) for a sheet.
+
+    MC/UNH sheets use the existing app behavior:
+      - "Shift Swaps for the week" = current LA calendar week
+      - "Future Swaps/Call outs"  = anything after that week
+
+    On-Call week tabs are different: each tab already corresponds to one specific
+    week, so it should only show that tab's own week in the weekly column and it
+    should not carry other On-Call weeks into the future column.
+    """
+    campus_key = _campus_key_for_sheet_title(title)
+    if campus_key == "ONCALL":
+        try:
+            wr = week_range_from_title(str(title or ""), today=today)
+        except Exception:
+            wr = None
+        if wr:
+            return wr[0], wr[1], False
+        cw0, cw1 = _week_bounds_sun_sat(today)
+        return cw0, cw1, False
+
+    cw0, cw1 = _week_bounds_sun_sat(today)
+    return cw0, cw1, True
+
+
+def _bucket_label_for_sheet_event(title: str, event_d: date, *, today: date) -> str | None:
+    bucket_start, bucket_end, allow_future = _bucket_window_for_sheet(title, today=today)
+    if event_d < bucket_start:
+        return None
+    if bucket_start <= event_d <= bucket_end:
+        return "weekly"
+    if allow_future and event_d > bucket_end:
+        return "future"
+    return None
 
 
 def _looks_like_week_tab(title: str) -> bool:
@@ -798,13 +862,11 @@ def sync_swaps_to_sheets(
     else:
         # Admin/manual run: update the primary schedule tabs only.
         for ws in with_backoff(ss.worksheets):
-            tl = (ws.title or "").strip().lower()
-            if tl in {"(names of hired oas)", "eo schedule policies", "audit log", "_locks"}:
+            if not _should_auto_sync_worksheet(ws):
                 continue
-            if ("(oa and goas)" in tl) or re.search(r"\bon\s*[- ]?call\b", tl):
-                weekly_sec, future_sec = _ensure_fixed_headers(ws)
-                targets.append(ws)
-                sections_by_title[ws.title] = (weekly_sec, future_sec)
+            weekly_sec, future_sec = _ensure_fixed_headers(ws)
+            targets.append(ws)
+            sections_by_title[ws.title] = (weekly_sec, future_sec)
 
     if not targets:
         raise ValueError("No schedule worksheets found to sync swaps into.")
@@ -835,6 +897,21 @@ def sync_swaps_to_sheets(
         weekly_sec, future_sec = sections_by_title[ws.title]
 
         campus_key = _campus_key_for_sheet_title(ws.title)
+        bucket_start, bucket_end, allow_future = _bucket_window_for_sheet(ws.title, today=today)
+
+        weekly_clear_predicate = None
+        future_clear_predicate = None
+        if campus_key == "ONCALL":
+            def _weekly_clear(txt: str, *, _today=bucket_start, _ws=bucket_start, _we=bucket_end) -> bool:
+                parsed = _infer_visible_row_date(txt, today=_today)
+                return bool(parsed is not None and not (_ws <= parsed <= _we))
+
+            def _future_clear(txt: str, *, _today=bucket_start) -> bool:
+                parsed = _infer_visible_row_date(txt, today=_today)
+                return bool(parsed is not None)
+
+            weekly_clear_predicate = _weekly_clear
+            future_clear_predicate = _future_clear
 
         def _campus_match(row: dict) -> bool:
             rc = str(row.get("campus", "") or "").strip()
@@ -868,16 +945,17 @@ def sync_swaps_to_sheets(
                 d = date.fromisoformat(str(c.get("event_date")))
             except Exception:
                 continue
-            if d < cw0:
+            bucket = _bucket_label_for_sheet_event(ws.title, d, today=today)
+            if not bucket:
                 continue
 
             caller_k = utils.name_key(str(c.get("caller_name", "")).strip())
             rows, _uncovered = _rows_from_callout(c, pickup_intervals=pickups_by_target.get((d, caller_k), []))
             if not rows:
                 continue
-            if cw0 <= d <= cw1:
+            if bucket == "weekly":
                 weekly_out.extend(rows)
-            elif d > cw1:
+            elif bucket == "future":
                 future_out.extend(rows)
 
         # Pickups: bucket by date.
@@ -891,9 +969,10 @@ def sync_swaps_to_sheets(
                 d = date.fromisoformat(d_iso)
             except Exception:
                 continue
-            if cw0 <= d <= cw1:
+            bucket = _bucket_label_for_sheet_event(ws.title, d, today=today)
+            if bucket == "weekly":
                 weekly_out.append(row)
-            elif d > cw1:
+            elif bucket == "future":
                 future_out.append(row)
 
         weekly_out.sort(key=lambda r: r.sort_key)
@@ -909,6 +988,7 @@ def sync_swaps_to_sheets(
                     key_col=KEY_WEEKLY_COL,
                     base_bg=SWAP_WEEKLY_BG,
                     clear_past_before=today,
+                    clear_visible_row_when=weekly_clear_predicate,
                 )
                 summary["weekly_written"] += n1
                 wrote_any = True
@@ -920,6 +1000,7 @@ def sync_swaps_to_sheets(
                     key_col=KEY_FUTURE_COL,
                     base_bg=SWAP_FUTURE_BG,
                     clear_past_before=today,
+                    clear_visible_row_when=future_clear_predicate,
                 )
                 summary["future_written"] += n2
                 wrote_any = True

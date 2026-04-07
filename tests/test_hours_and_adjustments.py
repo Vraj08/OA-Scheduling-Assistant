@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from oa_app.services import callouts_db, pickups_db
+from oa_app.jobs import sync_swaps_to_sheets
 from oa_app.ui import schedule_query
 
 
@@ -149,6 +150,57 @@ class AdjustmentDurationTests(unittest.TestCase):
 
         self.assertAlmostEqual(rows[0]["duration_hours"], 4.0)
         self.assertAlmostEqual(total, 4.0)
+
+
+class SyncRoutingTests(unittest.TestCase):
+    def test_oncall_previous_week_does_not_receive_next_week_events(self):
+        today = date(2026, 4, 7)
+        bucket = sync_swaps_to_sheets._bucket_label_for_sheet_event(
+            "On Call 4/5 - 4/11",
+            date(2026, 4, 12),
+            today=today,
+        )
+        self.assertIsNone(bucket)
+
+    def test_oncall_week_sheet_uses_its_own_week_for_weekly_bucket(self):
+        today = date(2026, 4, 7)
+        self.assertEqual(
+            sync_swaps_to_sheets._bucket_label_for_sheet_event(
+                "On Call 4/12 - 4/18",
+                date(2026, 4, 12),
+                today=today,
+            ),
+            "weekly",
+        )
+        self.assertIsNone(
+            sync_swaps_to_sheets._bucket_label_for_sheet_event(
+                "On Call 4/12 - 4/18",
+                date(2026, 4, 11),
+                today=today,
+            )
+        )
+
+    def test_mc_still_uses_future_column_for_later_weeks(self):
+        today = date(2026, 4, 7)
+        self.assertEqual(
+            sync_swaps_to_sheets._bucket_label_for_sheet_event(
+                "MC (OA and GOAs)",
+                date(2026, 4, 12),
+                today=today,
+            ),
+            "future",
+        )
+
+    def test_manual_sync_skips_hidden_oncall_tabs(self):
+        visible_oncall = SimpleNamespace(title="On Call 4/12 - 4/18", _properties={"hidden": False})
+        hidden_oncall = SimpleNamespace(title="On Call 4/19 - 4/25", _properties={"hidden": True})
+        visible_mc = SimpleNamespace(title="MC (OA and GOAs)", _properties={"hidden": False})
+        hidden_policy = SimpleNamespace(title="EO Schedule Policies", _properties={"hidden": False})
+
+        self.assertTrue(sync_swaps_to_sheets._should_auto_sync_worksheet(visible_oncall))
+        self.assertFalse(sync_swaps_to_sheets._should_auto_sync_worksheet(hidden_oncall))
+        self.assertTrue(sync_swaps_to_sheets._should_auto_sync_worksheet(visible_mc))
+        self.assertFalse(sync_swaps_to_sheets._should_auto_sync_worksheet(hidden_policy))
 
 
 if __name__ == "__main__":
