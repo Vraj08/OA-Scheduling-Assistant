@@ -142,6 +142,12 @@ def _combine_date_time_la(d: date, t) -> datetime:
     return datetime(d.year, d.month, d.day, int(hh), int(mm), tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
+def _duration_hours_between(start_at: datetime, end_at: datetime) -> float:
+    if end_at <= start_at:
+        end_at = end_at + timedelta(days=1)
+    return max(0.0, float((end_at - start_at).total_seconds() / 3600.0))
+
+
 def _oncall_event_date(sheet_title: str, day_canon: str) -> date | None:
     """Given an On-Call sheet title and canonical weekday, derive the calendar date."""
     ws = _oncall_week_start_from_title(sheet_title)
@@ -2568,6 +2574,7 @@ def run() -> None:
                                 "event_date": str(event_d),
                                 "shift_start_at": start_at.isoformat(timespec="seconds"),
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
+                                "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
                             }
                         )
                         db_ok = True
@@ -2687,6 +2694,7 @@ def run() -> None:
                                 "event_date": str(event_d),
                                 "shift_start_at": start_at.isoformat(timespec="seconds"),
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
+                                "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
                                 "picker_name": requester,
                                 "target_name": target,
                                 "note": kv.get("note"),
@@ -3572,6 +3580,7 @@ def run() -> None:
                                         "event_date": str(event_d),
                                         "shift_start_at": start_at.isoformat(timespec="seconds"),
                                         "shift_end_at": end_at.isoformat(timespec="seconds"),
+                                        "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
                                         "caller_name": canon_name,
                                         "reason": reason,
                                     }

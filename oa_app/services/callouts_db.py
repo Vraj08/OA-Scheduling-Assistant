@@ -11,7 +11,7 @@ This module is intentionally small:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from ..core.utils import name_key
@@ -35,6 +35,33 @@ def upsert_callout(payload: dict) -> dict:
     return data[0] if data else {}
 
 
+def _parse_iso_dt(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _coerce_duration_hours(row: dict[str, Any]) -> float:
+    try:
+        hours = float(row.get("duration_hours") or 0.0)
+    except Exception:
+        hours = 0.0
+    if hours > 0:
+        return float(hours)
+
+    start_at = _parse_iso_dt(row.get("shift_start_at"))
+    end_at = _parse_iso_dt(row.get("shift_end_at"))
+    if not (start_at and end_at):
+        return 0.0
+    if end_at <= start_at:
+        end_at = end_at + timedelta(days=1)
+    return max(0.0, float((end_at - start_at).total_seconds() / 3600.0))
+
+
 def list_callouts_for_week(*, caller_name: str, week_start: date, week_end: date) -> list[dict[str, Any]]:
     """Return current-week callout rows for one caller (best-effort)."""
     if not supabase_callouts_enabled():
@@ -43,7 +70,7 @@ def list_callouts_for_week(*, caller_name: str, week_start: date, week_end: date
     caller = (caller_name or "").strip()
     resp = with_retry(
         lambda: sb.table("callouts")
-        .select("event_date,duration_hours,caller_name")
+        .select("event_date,duration_hours,caller_name,shift_start_at,shift_end_at")
         .gte("event_date", str(week_start))
         .lte("event_date", str(week_end))
         .execute()
@@ -54,7 +81,9 @@ def list_callouts_for_week(*, caller_name: str, week_start: date, week_end: date
     for r in rows:
         if name_key(str(r.get("caller_name", ""))) != target_k:
             continue
-        out.append(r)
+        row = dict(r)
+        row["duration_hours"] = _coerce_duration_hours(row)
+        out.append(row)
     return out
 
 
