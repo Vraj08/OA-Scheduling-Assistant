@@ -671,6 +671,11 @@ def _bucket_label_for_sheet_event(title: str, event_d: date, *, today: date) -> 
     return None
 
 
+def _should_apply_grid_color_for_sheet(title: str, event_d: date, *, today: date) -> bool:
+    """Whether an event should recolor the visible schedule grid on this sheet."""
+    return _bucket_label_for_sheet_event(title, event_d, today=today) == "weekly"
+
+
 def _looks_like_week_tab(title: str) -> bool:
     """Heuristic: does a tab title represent a specific week?
 
@@ -703,10 +708,9 @@ def _apply_grid_colors(
     *,
     callouts: list[dict],
     pickups: list[dict],
-    cw0: date,
-    cw1: date,
+    today: date,
 ) -> list[str]:
-    """Color schedule grid for current-week events (best-effort)."""
+    """Color schedule grid for events that belong on this sheet (best-effort)."""
     errors: list[str] = []
     try:
         import streamlit as st
@@ -724,7 +728,7 @@ def _apply_grid_colors(
             d = date.fromisoformat(str(p.get("event_date")))
         except Exception:
             continue
-        if not (cw0 <= d <= cw1):
+        if not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
             continue
         sdt = _parse_dt(p.get("shift_start_at"))
         edt = _parse_dt(p.get("shift_end_at"))
@@ -741,7 +745,7 @@ def _apply_grid_colors(
             d = date.fromisoformat(str(c.get("event_date")))
         except Exception:
             continue
-        if not (cw0 <= d <= cw1):
+        if not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
             continue
         sdt = _parse_dt(c.get("shift_start_at"))
         edt = _parse_dt(c.get("shift_end_at"))
@@ -785,7 +789,7 @@ def _apply_grid_colors(
             d = date.fromisoformat(str(p.get("event_date")))
         except Exception:
             continue
-        if not (cw0 <= d <= cw1):
+        if not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
             continue
         sdt = _parse_dt(p.get("shift_start_at"))
         edt = _parse_dt(p.get("shift_end_at"))
@@ -1012,7 +1016,7 @@ def sync_swaps_to_sheets(
             continue
 
         if do_grid:
-            errs = _apply_grid_colors(ss, ws.title, callouts=c_rows, pickups=p_rows, cw0=cw0, cw1=cw1)
+            errs = _apply_grid_colors(ss, ws.title, callouts=c_rows, pickups=p_rows, today=today)
             summary["grid_errors"].extend(errs)
 
     # In strict single-sheet mode (approval path), bubble failures so the UI can

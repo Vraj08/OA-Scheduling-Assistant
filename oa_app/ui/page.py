@@ -23,6 +23,7 @@ from ..core import utils
 from ..core import week_range as week_range_mod
 from ..integrations.gspread_io import open_spreadsheet
 from ..services.audit_log import append_audit
+from ..services.approvals import get_request as get_approval_request
 from ..services.approvals import read_requests as read_approval_requests
 from ..services.approvals import set_status as set_approval_status
 from ..services.approvals import submit_request as submit_approval_request
@@ -75,6 +76,18 @@ def _week_bounds_la(ref: date | None = None) -> tuple[date, date]:
     sunday = d - timedelta(days=(d.weekday() + 1) % 7)
     saturday = sunday + timedelta(days=6)
     return sunday, saturday
+
+
+def _should_color_schedule_now(*, campus_key: str, event_d: date) -> bool:
+    """Whether a schedule-grid write should happen immediately.
+
+    UNH/MC keep the existing current-week-only coloring rule.
+    On-Call tabs are week-specific, so future visible week tabs should color now.
+    """
+    campus = str(campus_key or "").strip().upper()
+    cw0, cw1 = _week_bounds_la()
+    in_current_week = bool(cw0 <= event_d <= cw1)
+    return bool(in_current_week or campus == "ONCALL")
 
 
 def _worksheet_week_bounds(ss, campus_title: str) -> tuple[date, date] | None:
@@ -1165,35 +1178,34 @@ def _render_pickup_tradeboard(ss, schedule_global, canon_user: str | None) -> No
 .tb2-col { min-width: 210px; flex:1; }
 .tb2-dayhead { font-weight:750; font-size: 0.95rem; color: var(--oa-ink, #111827); margin: 0 0 8px 0; }
 .tb2-empty {
-  color: rgba(15,23,42,0.62);
+  color: var(--oa-trade-empty-ink, rgba(15,23,42,0.62));
   font-size:0.85rem;
   padding:10px 10px;
-  border:1px dashed rgba(15,23,42,0.16);
+  border:1px dashed var(--oa-trade-empty-border, rgba(15,23,42,0.16));
   border-radius: 8px;
-  background: linear-gradient(135deg, rgba(79,70,229,0.06), rgba(20,184,166,0.05));
+  background: var(--oa-trade-empty-bg, linear-gradient(135deg, rgba(79,70,229,0.06), rgba(20,184,166,0.05)));
   backdrop-filter: blur(6px);
 }
 .tb2-card {
-  /* Soft red accents that match the app's pastel background (less harsh than pure red) */
-  background: linear-gradient(135deg, rgba(238,242,255,0.80), rgba(224,231,255,0.58));
-  border:1px solid rgba(227,81,81,0.18);
-  border-left: 5px solid rgba(227,81,81,0.72);
+  background: var(--oa-trade-card-bg, linear-gradient(135deg, rgba(238,242,255,0.80), rgba(224,231,255,0.58)));
+  border:1px solid var(--oa-trade-card-border, rgba(227,81,81,0.18));
+  border-left: 5px solid var(--oa-trade-card-strip, rgba(227,81,81,0.72));
   border-radius: 10px;
   padding:10px 10px 10px 12px;
   margin: 0 0 10px 0;
-  box-shadow: 0 10px 22px rgba(2,6,23,0.06);
+  box-shadow: var(--oa-shadow-soft, 0 10px 22px rgba(2,6,23,0.06));
   backdrop-filter: blur(8px);
 }
 .tb2-top { display:flex; justify-content:space-between; gap:8px; align-items:center; }
-.tb2-time { font-weight:700; font-size:0.92rem; color:#111827; }
-.tb2-badge { font-size:0.72rem; font-weight:750; padding:3px 8px; border-radius:9px; color:#0f172a; background:linear-gradient(135deg, rgba(238,242,255,0.86), rgba(224,231,255,0.66)); border:1px solid rgba(15,23,42,0.12); white-space:nowrap; }
-.tb2-badge.unh { background:#e0f2fe; border-color:#bae6fd; }
-.tb2-badge.mc { background:#dcfce7; border-color:#bbf7d0; }
-.tb2-badge.oncall { background:#ffedd5; border-color:#fed7aa; }
-.tb2-sub { color:#6b7280; font-size:0.78rem; margin-top:4px; }
+.tb2-time { font-weight:700; font-size:0.92rem; color:var(--oa-trade-time-ink, #111827); }
+.tb2-badge { font-size:0.72rem; font-weight:750; padding:3px 8px; border-radius:9px; color:var(--oa-trade-badge-ink, #0f172a); background:var(--oa-trade-badge-bg, linear-gradient(135deg, rgba(238,242,255,0.86), rgba(224,231,255,0.66))); border:1px solid var(--oa-trade-badge-border, rgba(15,23,42,0.12)); white-space:nowrap; }
+.tb2-badge.unh { background:var(--oa-campus-unh-bg, #e0f2fe); border-color:var(--oa-campus-unh-border, #bae6fd); color:var(--oa-campus-unh-ink, #0c4a6e); }
+.tb2-badge.mc { background:var(--oa-campus-mc-bg, #dcfce7); border-color:var(--oa-campus-mc-border, #bbf7d0); color:var(--oa-campus-mc-ink, #14532d); }
+.tb2-badge.oncall { background:var(--oa-campus-oncall-bg, #ffedd5); border-color:var(--oa-campus-oncall-border, #fed7aa); color:var(--oa-campus-oncall-ink, #9a3412); }
+.tb2-sub { color:var(--oa-trade-sub-ink, #6b7280); font-size:0.78rem; margin-top:4px; }
 .tb2-names { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
-.tb2-nitem { background:linear-gradient(135deg, rgba(227,81,81,0.10), rgba(238,242,255,0.72)); border:1px solid rgba(227,81,81,0.18); border-radius:8px; padding:6px 8px; font-size:0.82rem; font-weight:650; color:#7f1d1d; line-height:1.1; }
-.tb2-nmore { color:rgba(127,29,29,0.86); font-size:0.8rem; font-weight:700; padding-left:2px; }
+.tb2-nitem { background:var(--oa-trade-name-bg, linear-gradient(135deg, rgba(227,81,81,0.10), rgba(238,242,255,0.72))); border:1px solid var(--oa-trade-name-border, rgba(227,81,81,0.18)); border-radius:8px; padding:6px 8px; font-size:0.82rem; font-weight:650; color:var(--oa-trade-name-ink, #7f1d1d); line-height:1.1; }
+.tb2-nmore { color:var(--oa-trade-more-ink, rgba(127,29,29,0.86)); font-size:0.8rem; font-weight:700; padding-left:2px; }
 /* Tighten Streamlit widgets inside columns */
 div[data-testid="column"] div.stButton>button { border-radius:12px; }
 </style>
@@ -1621,21 +1633,22 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                             if overtime_needed:
                                 details += f" | overtime: yes | week_after={week_after_mins/60:.2f} | day_after={day_after_mins/60:.2f}"
                             campus_key = ("ONCALL" if kind == "ONCALL" else kind)
-                            submit_approval_request(
-                                ss,
-                                requester=canon_user,
-                                action="pickup",
-                                campus=campus_key,
-                                day=day_canon.title(),
-                                start=fmt_time(req_s),
-                                end=fmt_time(req_e),
-                                details=_attach_details_meta(
-                                    details=details,
-                                    campus_key=campus_key,
-                                    sheet_title=sheet_title,
-                                    sheet_gid=_sheet_gid_for_title(schedule_global, sheet_title),
-                                ),
-                            )
+                            with st.spinner("Submitting request..."):
+                                submit_approval_request(
+                                    ss,
+                                    requester=canon_user,
+                                    action="pickup",
+                                    campus=campus_key,
+                                    day=day_canon.title(),
+                                    start=fmt_time(req_s),
+                                    end=fmt_time(req_e),
+                                    details=_attach_details_meta(
+                                        details=details,
+                                        campus_key=campus_key,
+                                        sheet_title=sheet_title,
+                                        sheet_gid=_sheet_gid_for_title(schedule_global, sheet_title),
+                                    ),
+                                )
                             st.session_state["APPROVALS_EPOCH"] = st.session_state.get("APPROVALS_EPOCH", 0) + 1
                             st.session_state.pop("TB2_MODAL", None)
                             _flash("success", "Pickup request submitted for approval.")
@@ -1913,21 +1926,22 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                         f" | day_after={day_after_mins/60:.2f}"
                     )
                 campus_key = ("ONCALL" if w.kind == "ONCALL" else w.kind)
-                submit_approval_request(
-                    ss,
-                    requester=canon_user,
-                    action="pickup",
-                    campus=campus_key,
-                    day=w.day_canon.title(),
-                    start=fmt_time(req_s),
-                    end=fmt_time(req_e),
-                    details=_attach_details_meta(
-                        details=details,
-                        campus_key=campus_key,
-                        sheet_title=w.campus_title,
-                        sheet_gid=_sheet_gid_for_title(schedule_global, w.campus_title),
-                    ),
-                )
+                with st.spinner("Submitting request..."):
+                    submit_approval_request(
+                        ss,
+                        requester=canon_user,
+                        action="pickup",
+                        campus=campus_key,
+                        day=w.day_canon.title(),
+                        start=fmt_time(req_s),
+                        end=fmt_time(req_e),
+                        details=_attach_details_meta(
+                            details=details,
+                            campus_key=campus_key,
+                            sheet_title=w.campus_title,
+                            sheet_gid=_sheet_gid_for_title(schedule_global, w.campus_title),
+                        ),
+                    )
                 _flash("success", "Pickup request submitted for approval.")
                 st.rerun()
             except Exception as e:
@@ -1938,24 +1952,22 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
 
 def run() -> None:
     st.set_page_config(page_title="OA Scheduling Assistant", page_icon="🗓️", layout="wide")
+    legacy_mode = str(st.session_state.get("UI_THEME_MODE", "")).strip().lower()
+    if "UI_THEME_DARK" not in st.session_state:
+        st.session_state["UI_THEME_DARK"] = bool(legacy_mode == "dark")
+    theme_mode = "dark" if bool(st.session_state.get("UI_THEME_DARK", False)) else "light"
+    st.session_state["UI_THEME_MODE"] = theme_mode
     # Global UI theme (purely visual). Safe: no functional behavior changes.
-    apply_vibrant_theme()
+    apply_vibrant_theme(theme_mode)
     # Global, fixed footer visible on every screen.
     render_global_footer()
 
     # Hero header (visual only)
     st.markdown(
         """
-        <div style="
-          padding: 1.05rem 1.15rem;
-          border-radius: 18px;
-          border: 1px solid rgba(15,23,42,0.10);
-          background: linear-gradient(135deg, rgba(79,70,229,0.10), rgba(20,184,166,0.08));
-          box-shadow: 0 12px 30px rgba(2,6,23,0.08);
-          margin-bottom: 1.05rem;
-        ">
-          <div style="font-size: 1.55rem; font-weight: 900; letter-spacing: -0.3px;">🗓️ OA Scheduling Assistant</div>
-          <div style="margin-top: 0.25rem; font-size: 0.98rem; opacity: 0.80;">
+        <div class="oa-hero">
+          <div class="oa-hero__title">🗓️ OA Scheduling Assistant</div>
+          <div class="oa-hero__sub">
             Enter your name, pick an action (Add / Remove / Call-Out). Guided steps ensure caps and available slots.
           </div>
         </div>
@@ -2043,6 +2055,8 @@ def run() -> None:
 
     # Sidebar
     with st.sidebar:
+        st.toggle("Dark mode", key="UI_THEME_DARK")
+
         st.subheader("Who are you?")
 
         # Name entry (match against roster display names from (Names of hired OAs)).
@@ -2531,12 +2545,9 @@ def run() -> None:
                     if not event_d:
                         raise ValueError("Could not derive On-Call event date from sheet title")
 
-                # Keep the existing current-week rule for MC/UNH, but allow On-Call
-                # callouts to mark their schedule cells red even when the shift is in
-                # a future week tab.
-                cw0, cw1 = _week_bounds_la()
-                in_current_week = bool(cw0 <= event_d <= cw1)
-                should_color_now = bool(in_current_week or campus_key == "ONCALL")
+                # Keep the existing current-week rule for MC/UNH, but allow
+                # On-Call week tabs to color their own schedule grid immediately.
+                should_color_now = _should_color_schedule_now(campus_key=campus_key, event_d=event_d)
 
                 if should_color_now:
                     msg = chat_callout.handle_callout(
@@ -2603,8 +2614,9 @@ def run() -> None:
 
                         sb = get_supabase()
                         # Sync only the worksheet the request was submitted from.
-                        # Swap-section sync is write-only and does not need to recolor the grid.
-                        # Grid colors are handled directly by the approve action to avoid Sheets read-quota (429).
+                        # For On-Call, also allow a single-sheet recolor pass so the
+                        # exact future week tab is corrected even if the direct grid
+                        # write missed for any reason.
                         # Prefer the already-loaded worksheet object (avoids extra Sheets read calls).
                         ws_obj = None
                         try:
@@ -2619,7 +2631,7 @@ def run() -> None:
                             sb,
                             worksheet=ws_obj,
                             sheet_title=campus_ws_title,
-                            apply_grid_colors=False,
+                            apply_grid_colors=(campus_key == "ONCALL"),
                         )
                         sheet_errs = res.get("sheet_errors") or []
                         if sheet_errs:
@@ -2657,10 +2669,9 @@ def run() -> None:
                     if not event_d:
                         raise ValueError("Could not derive On-Call event date from sheet title")
 
-                cw0, cw1 = _week_bounds_la()
-                in_current_week = bool(cw0 <= event_d <= cw1)
+                should_color_now = _should_color_schedule_now(campus_key=campus_key, event_d=event_d)
 
-                if in_current_week:
+                if should_color_now:
                     msg = chat_callout.handle_callout(
                         st,
                         ss,
@@ -2738,7 +2749,7 @@ def run() -> None:
                             sb,
                             worksheet=ws_obj,
                             sheet_title=campus_ws_title,
-                            apply_grid_colors=False,
+                            apply_grid_colors=(campus_key == "ONCALL"),
                         )
                         sheet_errs = res.get("sheet_errors") or []
                         if sheet_errs:
@@ -2806,15 +2817,41 @@ def run() -> None:
                     disabled=disabled,
                 ):
                     try:
-                        msg = _apply_request(req)
-                        set_approval_status(
-                            ss,
-                            row=int(req.get("_row", 0)),
-                            req_id=str(req.get("ID", "")),
-                            status="APPROVED",
-                            reviewed_by=canon_name,
-                            note=note,
-                        )
+                        req_row = int(req.get("_row", 0))
+                        req_id = str(req.get("ID", ""))
+                        fresh_req = get_approval_request(ss, row=req_row, req_id=req_id) or req
+                        fresh_status = str(fresh_req.get("Status", "")).strip().upper()
+                        if fresh_status != "PENDING":
+                            _flash("info", f"This request is already {fresh_status or 'processed'}.")
+                            st.session_state["APPROVALS_EPOCH"] = st.session_state.get("APPROVALS_EPOCH", 0) + 1
+                            st.session_state["_SCROLL_TO_PENDING"] = True
+                            st.rerun()
+
+                        with st.spinner("Applying request..."):
+                            msg = _apply_request(fresh_req)
+
+                        try:
+                            set_approval_status(
+                                ss,
+                                row=req_row,
+                                req_id=req_id,
+                                status="APPROVED",
+                                reviewed_by=canon_name,
+                                note=note,
+                            )
+                        except Exception:
+                            latest = get_approval_request(ss, row=req_row, req_id=req_id) or {}
+                            latest_status = str(latest.get("Status", "")).strip().upper()
+                            if latest_status != "APPROVED":
+                                _flash(
+                                    "error",
+                                    "The schedule change was applied, but the approval record could not be updated. "
+                                    "Refresh once before trying again.",
+                                )
+                                st.session_state["APPROVALS_EPOCH"] = st.session_state.get("APPROVALS_EPOCH", 0) + 1
+                                st.session_state["_SCROLL_TO_PENDING"] = True
+                                st.rerun()
+
                         _flash("success", f"✅ Approved. {str(msg).strip()}")
                         st.session_state["APPROVALS_EPOCH"] = st.session_state.get("APPROVALS_EPOCH", 0) + 1
                         st.session_state["_SCROLL_TO_PENDING"] = True
@@ -2824,16 +2861,21 @@ def run() -> None:
                                 del st.session_state[_k]
                         st.rerun()
                     except Exception as e:
+                        if maybe_show_recovery_popup(e, where="approving request"):
+                            return
                         err = _strip_debug_blob(str(e))
-                        set_approval_status(
-                            ss,
-                            row=int(req.get("_row", 0)),
-                            req_id=str(req.get("ID", "")),
-                            status="FAILED",
-                            reviewed_by=canon_name,
-                            note=note or "",
-                            error_message=err,
-                        )
+                        try:
+                            set_approval_status(
+                                ss,
+                                row=int(req.get("_row", 0)),
+                                req_id=str(req.get("ID", "")),
+                                status="FAILED",
+                                reviewed_by=canon_name,
+                                note=note or "",
+                                error_message=err,
+                            )
+                        except Exception:
+                            pass
                         _flash("error", err)
                         st.session_state["APPROVALS_EPOCH"] = st.session_state.get("APPROVALS_EPOCH", 0) + 1
                         st.session_state["_SCROLL_TO_PENDING"] = True
@@ -3178,21 +3220,22 @@ def run() -> None:
                             if conflict:
                                 raise ValueError(conflict)
 
-                        rid = submit_approval_request(
-                            ss,
-                            requester=canon_name,
-                            action="add",
-                            campus=("ONCALL" if kind == "ONCALL" else kind),
-                            day=day_canon.title(),
-                            start=fmt_time(chosen[0]),
-                            end=fmt_time(chosen[1]),
-                            details=_attach_details_meta(
-                                details="requested",
-                                campus_key=("ONCALL" if kind == "ONCALL" else kind),
-                                sheet_title=active_tab,
-                                sheet_gid=_sheet_gid_for_title(schedule_global, active_tab),
-                            ),
-                        )
+                        with st.spinner("Submitting request..."):
+                            rid = submit_approval_request(
+                                ss,
+                                requester=canon_name,
+                                action="add",
+                                campus=("ONCALL" if kind == "ONCALL" else kind),
+                                day=day_canon.title(),
+                                start=fmt_time(chosen[0]),
+                                end=fmt_time(chosen[1]),
+                                details=_attach_details_meta(
+                                    details="requested",
+                                    campus_key=("ONCALL" if kind == "ONCALL" else kind),
+                                    sheet_title=active_tab,
+                                    sheet_gid=_sheet_gid_for_title(schedule_global, active_tab),
+                                ),
+                            )
                         st.session_state["mode"] = None
                         st.session_state["sched_expanded"] = True
                         _flash("success", f"🕓 Submitted for approval (id {rid}).")
@@ -3319,21 +3362,22 @@ def run() -> None:
                 if (sdt is not None and edt is not None) and st.button("Remove"):
                     try:
                         if want_approval or force_approval:
-                            rid = submit_approval_request(
-                                ss,
-                                requester=canon_name,
-                                action="remove",
-                                campus=("ONCALL" if kind == "ONCALL" else kind),
-                                day=day_canon.title(),
-                                start=fmt_time(sdt),
-                                end=fmt_time(edt),
-                                details=_attach_details_meta(
-                                    details="requested",
-                                    campus_key=("ONCALL" if kind == "ONCALL" else kind),
-                                    sheet_title=active_tab,
-                                    sheet_gid=_sheet_gid_for_title(schedule_global, active_tab),
-                                ),
-                            )
+                            with st.spinner("Submitting request..."):
+                                rid = submit_approval_request(
+                                    ss,
+                                    requester=canon_name,
+                                    action="remove",
+                                    campus=("ONCALL" if kind == "ONCALL" else kind),
+                                    day=day_canon.title(),
+                                    start=fmt_time(sdt),
+                                    end=fmt_time(edt),
+                                    details=_attach_details_meta(
+                                        details="requested",
+                                        campus_key=("ONCALL" if kind == "ONCALL" else kind),
+                                        sheet_title=active_tab,
+                                        sheet_gid=_sheet_gid_for_title(schedule_global, active_tab),
+                                    ),
+                                )
                             st.session_state["mode"] = None
                             st.session_state["sched_expanded"] = True
                             _flash("success", f"🕓 Submitted for approval (id {rid}).")
@@ -3538,11 +3582,8 @@ def run() -> None:
                                 raise ValueError("Could not derive On-Call event date from sheet title")
 
                         # Keep the existing current-week rule for MC/UNH, but allow
-                        # On-Call callouts to mark their schedule cells red even when
-                        # the shift is in a future week tab.
-                        cw0, cw1 = _week_bounds_la()
-                        in_current_week = bool(cw0 <= event_d <= cw1)
-                        should_color_now = bool(in_current_week or campus_key == "ONCALL")
+                        # On-Call week tabs to color their own schedule grid immediately.
+                        should_color_now = _should_color_schedule_now(campus_key=campus_key, event_d=event_d)
 
                         if should_color_now:
                             msg = chat_callout.handle_callout(
@@ -3608,7 +3649,7 @@ def run() -> None:
                                     sb,
                                     worksheet=ws_obj,
                                     sheet_title=active_tab,
-                                    apply_grid_colors=False,
+                                    apply_grid_colors=(campus_key == "ONCALL"),
                                 )
                             except Exception as e:
                                 st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")

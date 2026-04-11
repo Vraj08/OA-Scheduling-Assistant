@@ -3,7 +3,7 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from oa_app.services import callouts_db, pickups_db
+from oa_app.services import approvals, callouts_db, pickups_db
 from oa_app.jobs import sync_swaps_to_sheets
 from oa_app.ui import schedule_query
 
@@ -31,6 +31,24 @@ class _FakeSupabase:
 
     def table(self, name):
         return _FakeQuery(self._table_rows.get(name, []))
+
+
+class _FakeApprovalSheet:
+    def __init__(self, *, fail_append: bool = False, fail_update: bool = False):
+        self.fail_append = fail_append
+        self.fail_update = fail_update
+        self.appended_rows = []
+        self.updated_ranges = []
+
+    def append_row(self, row, value_input_option="RAW"):
+        if self.fail_append:
+            raise RuntimeError("append failed")
+        self.appended_rows.append((list(row), value_input_option))
+
+    def update(self, range_name, values):
+        if self.fail_update:
+            raise RuntimeError("update failed")
+        self.updated_ranges.append((range_name, values))
 
 
 class ScheduleQueryHoursTests(unittest.TestCase):
@@ -152,6 +170,90 @@ class AdjustmentDurationTests(unittest.TestCase):
         self.assertAlmostEqual(total, 4.0)
 
 
+class ApprovalWorkflowTests(unittest.TestCase):
+    def test_submit_request_reuses_matching_pending_request_before_insert(self):
+        existing = {
+            "ID": "abc123",
+            "Requester": "Alex Smith",
+            "Action": "pickup",
+            "Campus": "ONCALL",
+            "Day": "Sunday",
+            "Start": "7:00 PM",
+            "End": "12:00 AM",
+            "Details": "META={\"sheet_title\":\"On Call 4/12 - 4/18\"} | target=Taylor",
+            "Status": "PENDING",
+        }
+
+        with patch.object(approvals, "_use_db", return_value=False), patch.object(
+            approvals, "read_requests", return_value=[existing]
+        ), patch.object(approvals, "ensure_approval_sheet") as ensure_sheet:
+            rid = approvals.submit_request(
+                SimpleNamespace(),
+                requester="Alex Smith",
+                action="pickup",
+                campus="ONCALL",
+                day="Sunday",
+                start="7:00 PM",
+                end="12:00 AM",
+                details="META={\"sheet_title\":\"On Call 4/12 - 4/18\"} | target=Taylor",
+            )
+
+        self.assertEqual(rid, "abc123")
+        ensure_sheet.assert_not_called()
+
+    def test_submit_request_recovers_existing_request_after_append_error(self):
+        existing = {
+            "ID": "xyz999",
+            "Requester": "Alex Smith",
+            "Action": "add",
+            "Campus": "MC",
+            "Day": "Monday",
+            "Start": "8:00 AM",
+            "End": "10:00 AM",
+            "Details": "META={\"sheet_title\":\"MC (OA and GOAs)\"} | requested",
+            "Status": "PENDING",
+        }
+        ws = _FakeApprovalSheet(fail_append=True)
+
+        with patch.object(approvals, "_use_db", return_value=False), patch.object(
+            approvals, "read_requests", side_effect=[[], [existing]]
+        ), patch.object(approvals, "ensure_approval_sheet", return_value=ws), patch.object(
+            approvals, "bump_ws_version"
+        ):
+            rid = approvals.submit_request(
+                SimpleNamespace(),
+                requester="Alex Smith",
+                action="add",
+                campus="MC",
+                day="Monday",
+                start="8:00 AM",
+                end="10:00 AM",
+                details="META={\"sheet_title\":\"MC (OA and GOAs)\"} | requested",
+            )
+
+        self.assertEqual(rid, "xyz999")
+
+    def test_set_status_treats_already_updated_row_as_success(self):
+        ws = _FakeApprovalSheet(fail_update=True)
+        approved = {
+            "ID": "done42",
+            "Status": "APPROVED",
+            "_row": 7,
+        }
+
+        with patch.object(approvals, "_use_db", return_value=False), patch.object(
+            approvals, "ensure_approval_sheet", return_value=ws
+        ), patch.object(approvals, "get_request", return_value=approved):
+            approvals.set_status(
+                SimpleNamespace(),
+                row=7,
+                req_id="done42",
+                status="APPROVED",
+                reviewed_by="Vraj",
+                note="ok",
+            )
+
+
 class SyncRoutingTests(unittest.TestCase):
     def test_oncall_previous_week_does_not_receive_next_week_events(self):
         today = date(2026, 4, 7)
@@ -189,6 +291,33 @@ class SyncRoutingTests(unittest.TestCase):
                 today=today,
             ),
             "future",
+        )
+
+    def test_oncall_future_week_sheet_still_applies_grid_colors_for_its_own_events(self):
+        today = date(2026, 4, 11)
+        self.assertTrue(
+            sync_swaps_to_sheets._should_apply_grid_color_for_sheet(
+                "On Call 4/12 - 4/18",
+                date(2026, 4, 12),
+                today=today,
+            )
+        )
+        self.assertFalse(
+            sync_swaps_to_sheets._should_apply_grid_color_for_sheet(
+                "On Call 4/5 - 4/11",
+                date(2026, 4, 12),
+                today=today,
+            )
+        )
+
+    def test_mc_future_week_sheet_does_not_apply_grid_colors_early(self):
+        today = date(2026, 4, 11)
+        self.assertFalse(
+            sync_swaps_to_sheets._should_apply_grid_color_for_sheet(
+                "MC (OA and GOAs)",
+                date(2026, 4, 12),
+                today=today,
+            )
         )
 
     def test_manual_sync_skips_hidden_oncall_tabs(self):

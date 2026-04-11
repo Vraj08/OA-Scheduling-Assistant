@@ -44,21 +44,12 @@ def render_global_footer() -> None:
             font-size: 0.80rem;
             line-height: 1.1rem;
             letter-spacing: 0.2px;
-            border: 1px solid rgba(49, 51, 63, 0.12);
-            background: rgba(255, 255, 255, 0.70);
-            color: rgba(49, 51, 63, 0.72);
+            border: 1px solid var(--oa-footer-border, rgba(49, 51, 63, 0.12));
+            background: var(--oa-footer-bg, rgba(255, 255, 255, 0.70));
+            color: var(--oa-footer-ink, rgba(49, 51, 63, 0.72));
             backdrop-filter: blur(10px);
             -webkit-backdrop-filter: blur(10px);
-            box-shadow: 0 6px 22px rgba(0, 0, 0, 0.06);
-          }
-
-          @media (prefers-color-scheme: dark) {
-            .vp-global-footer .vp-global-footer__inner {
-              border: 1px solid rgba(255, 255, 255, 0.12);
-              background: rgba(17, 17, 17, 0.55);
-              color: rgba(255, 255, 255, 0.72);
-              box-shadow: 0 6px 22px rgba(0, 0, 0, 0.30);
-            }
+            box-shadow: var(--oa-shadow-soft, 0 6px 22px rgba(0, 0, 0, 0.06));
           }
         </style>
         """,
