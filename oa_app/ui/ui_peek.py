@@ -8,6 +8,35 @@ from ..config import ONCALL_MAX_COLS, ONCALL_MAX_ROWS
 from ..core.quotas import read_cols_exact, _safe_batch_get
 
 
+_HEADER_KEYWORDS = {
+    "time",
+    "name",
+    "role",
+    "email",
+    "phone",
+    "campus",
+    "day",
+    "start",
+    "end",
+    "details",
+    "status",
+    "requester",
+    "action",
+    "reviewedby",
+    "reviewedat",
+    "id",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+}
+_DATEISH_RE = re.compile(r"\b\d{1,4}\s*[-/]\s*\d{1,2}(?:\s*[-/]\s*\d{1,4})?\b")
+_TIMEISH_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b", re.I)
+
+
 def _unique_display_headers(hdr):
     """Make worksheet headers safe for Streamlit/PyArrow rendering."""
     out = []
@@ -27,6 +56,25 @@ def _unique_display_headers(hdr):
     return out
 
 
+def _row_looks_like_header(hdr):
+    cells = [str(c or "").strip() for c in (hdr or [])]
+    nonempty = [c for c in cells if c]
+    if not nonempty:
+        return False
+    if len(nonempty) < len(cells):
+        return True
+
+    for cell in nonempty:
+        low = cell.lower()
+        if low in _HEADER_KEYWORDS:
+            return True
+        if any(tok in _HEADER_KEYWORDS for tok in re.findall(r"[a-z]+", low)):
+            return True
+        if _DATEISH_RE.search(low) or _TIMEISH_RE.search(low):
+            return True
+    return False
+
+
 def _df_from_grid(vals):
     """Convert a gspread batch_get grid (list of rows) into a dataframe."""
     if not vals:
@@ -34,11 +82,15 @@ def _df_from_grid(vals):
     hdr = vals[0] if vals else []
     body = vals[1:] if len(vals) > 1 else []
     # If the first row looks like a header, use it.
-    if any((c or "").strip() for c in hdr):
+    if _row_looks_like_header(hdr):
         w = len(hdr)
         norm = [r + [""] * (w - len(r)) if len(r) < w else r[:w] for r in body]
         return pd.DataFrame(norm, columns=_unique_display_headers(hdr))
-    return pd.DataFrame(vals)
+    width = max(len(r or []) for r in vals) if vals else 0
+    if width <= 0:
+        return pd.DataFrame()
+    norm = [(r or []) + [""] * (width - len(r or [])) for r in vals]
+    return pd.DataFrame(norm, columns=[f"Column {idx}" for idx in range(1, width + 1)])
 
 
 def _render_sheet_as_table(ss, title: str, *, max_cols: int = ONCALL_MAX_COLS, max_rows: int = ONCALL_MAX_ROWS):

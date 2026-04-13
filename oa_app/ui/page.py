@@ -127,6 +127,52 @@ def _parse_details_kv(details_rest: str) -> dict[str, str]:
     return out
 
 
+def _format_request_details_for_display(details: str) -> str:
+    """Humanize request details for approver/requester UI."""
+    _meta, details_rest = _extract_details_meta(details)
+    lines: list[str] = []
+
+    for raw_part in [p.strip() for p in str(details_rest or "").split("|") if p.strip()]:
+        m = re.match(r"^([a-z_]+)\s*[:=]\s*(.+)$", raw_part, flags=re.I)
+        if not m:
+            lines.append(raw_part)
+            continue
+
+        key = m.group(1).strip().lower()
+        value = m.group(2).strip()
+
+        if key == "target":
+            lines.append(f"Target: {value}")
+        elif key == "date":
+            lines.append(f"Date: {value}")
+        elif key == "overtime":
+            lines.append("Overtime requested: Yes" if value.lower() == "yes" else f"Overtime requested: {value}")
+        elif key == "day_after":
+            lines.append(f"Total hours for the day: {value}")
+        elif key == "week_after":
+            lines.append(f"Total hours for the week: {value}")
+        elif key == "reason":
+            lines.append(f"Reason: {value}")
+        elif key == "note":
+            lines.append(f"Note: {value}")
+        else:
+            lines.append(f"{key.replace('_', ' ').title()}: {value}")
+
+    return "\n".join(lines).strip()
+
+
+def _format_callout_reason(reason: str) -> str:
+    raw = str(reason or "").strip()
+    if not raw:
+        return ""
+    if ":" in raw:
+        head, tail = raw.split(":", 1)
+        head = head.strip().title()
+        tail = tail.strip()
+        return f"{head}: {tail}" if tail else head
+    return raw.title()
+
+
 def _ensure_la_timestamptz(ts: str) -> str:
     """Ensure an ISO timestamp string has timezone info (America/Los_Angeles).
 
@@ -220,6 +266,20 @@ def _cached_weekly_supabase_adjustments(user_name: str, week_start: str, week_en
     except Exception:
         pickup_h = 0.0
     return {"callout_hours": float(callout_h), "pickup_hours": float(pickup_h)}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_late_notice_callouts(week_start: str, week_end: str) -> list[dict]:
+    """Current-week late-notice callouts for approver visibility."""
+    try:
+        ws = date.fromisoformat(week_start)
+        we = date.fromisoformat(week_end)
+    except Exception:
+        ws, we = _week_bounds_la()
+    try:
+        return callouts_db.list_late_notice_callouts(week_start=ws, week_end=we, limit=200)
+    except Exception:
+        return []
 
 
 def _extract_details_meta(details: str) -> tuple[dict, str]:
@@ -2451,6 +2511,10 @@ def run() -> None:
             rows_all = []
         pending = [r for r in rows_all if str(r.get("Status", "")).upper() == "PENDING"]
         history = [r for r in rows_all if str(r.get("Status", "")).upper() != "PENDING"]
+        late_callouts: list[dict] = []
+        if callouts_db.supabase_callouts_enabled():
+            ws_notice, we_notice = _week_bounds_la()
+            late_callouts = _cached_late_notice_callouts(str(ws_notice), str(we_notice))
 
         pending_ot = [r for r in pending if _is_overtime_request(r)]
         pending_regular = [r for r in pending if not _is_overtime_request(r)]
@@ -2459,6 +2523,37 @@ def run() -> None:
             f"Approved: {sum(1 for r in history if str(r.get('Status', '')).upper() == 'APPROVED')} • "
             f"Rejected: {sum(1 for r in history if str(r.get('Status', '')).upper() == 'REJECTED')}"
         )
+
+        with st.expander(f"📣 Late callout notices ({len(late_callouts)})", expanded=bool(late_callouts)):
+            st.caption(
+                "Sick callouts submitted under 2 hours before shift and all other callouts submitted under 48 hours before shift."
+            )
+            if not callouts_db.supabase_callouts_enabled():
+                st.info("Callout notice alerts are unavailable because Supabase is not configured.")
+            elif not late_callouts:
+                st.success("No late-notice callouts this week.")
+            else:
+                def _fmt_shift_time(ts: str) -> str:
+                    dt = _parse_iso_dt(ts)
+                    if not dt:
+                        return ""
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+                    return dt.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%I:%M %p").lstrip("0")
+
+                alert_table = [
+                    {
+                        "Caller": row.get("caller_name", ""),
+                        "Campus": row.get("campus", ""),
+                        "Date": row.get("event_date", ""),
+                        "Shift": f"{_fmt_shift_time(str(row.get('shift_start_at') or ''))}-{_fmt_shift_time(str(row.get('shift_end_at') or ''))}",
+                        "Reason": _format_callout_reason(str(row.get("reason", "") or "")),
+                        "Notice (hrs)": f"{float(row.get('notice_hours') or 0.0):.2f}",
+                        "Rule": row.get("late_notice_rule", ""),
+                    }
+                    for row in late_callouts
+                ]
+                st.dataframe(alert_table, hide_index=True, use_container_width=True)
 
         tab_inbox, tab_ot, tab_hist = st.tabs(
             [f"📥 Inbox ({len(pending_regular)})", f"⏱️ Overtime ({len(pending_ot)})", f"🗂️ History ({len(history)})"]
@@ -2797,8 +2892,9 @@ def run() -> None:
             meta, det_rest = _extract_details_meta(det)
             if meta.get("sheet_title"):
                 st.caption(f"Sheet: {meta.get('sheet_title')}")
-            if det_rest:
-                st.info(det_rest)
+            det_display = _format_request_details_for_display(det)
+            if det_display:
+                st.info(det_display)
 
             note = st.text_input("Note (optional)", key=f"{key_prefix}.note")
             c1, c2 = st.columns(2)
@@ -3006,7 +3102,7 @@ def run() -> None:
                         "Start": r.get("Start", ""),
                         "End": r.get("End", ""),
                         "Status": _status_chip(str(r.get("Status", ""))),
-                        "Details": r.get("Details", ""),
+                        "Details": _format_request_details_for_display(str(r.get("Details", "") or "")),
                     }
                     for r in pending[:200]
                 ]

@@ -170,6 +170,92 @@ class AdjustmentDurationTests(unittest.TestCase):
         self.assertAlmostEqual(total, 4.0)
 
 
+class CalloutNoticeTests(unittest.TestCase):
+    def test_late_notice_callouts_use_notice_hours_policy(self):
+        supabase = _FakeSupabase(
+            {
+                "callouts": [
+                    {
+                        "event_date": "2026-04-13",
+                        "caller_name": "Alex Smith",
+                        "campus": "MC",
+                        "reason": "sick",
+                        "notice_hours": 1.5,
+                        "submitted_at": "2026-04-13T06:30:00-07:00",
+                        "shift_start_at": "2026-04-13T08:00:00-07:00",
+                        "shift_end_at": "2026-04-13T10:00:00-07:00",
+                        "duration_hours": 2.0,
+                    },
+                    {
+                        "event_date": "2026-04-14",
+                        "caller_name": "Taylor Jones",
+                        "campus": "UNH",
+                        "reason": "personal",
+                        "notice_hours": 20.0,
+                        "submitted_at": "2026-04-13T09:00:00-07:00",
+                        "shift_start_at": "2026-04-14T05:00:00-07:00",
+                        "shift_end_at": "2026-04-14T09:00:00-07:00",
+                        "duration_hours": 4.0,
+                    },
+                    {
+                        "event_date": "2026-04-15",
+                        "caller_name": "Jordan Lee",
+                        "campus": "ONCALL",
+                        "reason": "sick",
+                        "notice_hours": 6.0,
+                        "submitted_at": "2026-04-15T01:00:00-07:00",
+                        "shift_start_at": "2026-04-15T07:00:00-07:00",
+                        "shift_end_at": "2026-04-15T11:00:00-07:00",
+                        "duration_hours": 4.0,
+                    },
+                ]
+            }
+        )
+
+        with patch.object(callouts_db, "supabase_callouts_enabled", return_value=True), patch.object(
+            callouts_db, "get_supabase", return_value=supabase
+        ), patch.object(callouts_db, "with_retry", side_effect=lambda fn: fn()):
+            rows = callouts_db.list_late_notice_callouts(
+                week_start=date(2026, 4, 12),
+                week_end=date(2026, 4, 18),
+            )
+
+        self.assertEqual([r["caller_name"] for r in rows], ["Taylor Jones", "Alex Smith"])
+        self.assertEqual(rows[0]["late_notice_rule"], "Non-sick callout under 48 hours")
+        self.assertEqual(rows[1]["late_notice_rule"], "Sick callout under 2 hours")
+
+    def test_late_notice_callouts_fall_back_to_timestamp_difference(self):
+        supabase = _FakeSupabase(
+            {
+                "callouts": [
+                    {
+                        "event_date": "2026-04-13",
+                        "caller_name": "Alex Smith",
+                        "campus": "MC",
+                        "reason": "other:travel",
+                        "notice_hours": None,
+                        "submitted_at": "2026-04-13T08:00:00-07:00",
+                        "shift_start_at": "2026-04-14T07:00:00-07:00",
+                        "shift_end_at": "2026-04-14T09:00:00-07:00",
+                        "duration_hours": 2.0,
+                    }
+                ]
+            }
+        )
+
+        with patch.object(callouts_db, "supabase_callouts_enabled", return_value=True), patch.object(
+            callouts_db, "get_supabase", return_value=supabase
+        ), patch.object(callouts_db, "with_retry", side_effect=lambda fn: fn()):
+            rows = callouts_db.list_late_notice_callouts(
+                week_start=date(2026, 4, 12),
+                week_end=date(2026, 4, 18),
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["notice_hours"], 23.0)
+        self.assertEqual(rows[0]["late_notice_rule"], "Non-sick callout under 48 hours")
+
+
 class ApprovalWorkflowTests(unittest.TestCase):
     def test_submit_request_reuses_matching_pending_request_before_insert(self):
         existing = {
@@ -309,6 +395,26 @@ class OvertimeBaselineTests(unittest.TestCase):
         self.assertEqual(per_day["monday"], 240)
 
 
+class RequestDetailsDisplayTests(unittest.TestCase):
+    def test_overtime_details_are_humanized_for_display(self):
+        details = (
+            'META={"sheet_title":"MC (OA and GOAs)"}'
+            " | target=Taylor Jones"
+            " | overtime: yes"
+            " | week_after=21.50"
+            " | day_after=8.50"
+        )
+
+        rendered = page._format_request_details_for_display(details)
+
+        self.assertIn("Target: Taylor Jones", rendered)
+        self.assertIn("Overtime requested: Yes", rendered)
+        self.assertIn("Total hours for the day: 8.50", rendered)
+        self.assertIn("Total hours for the week: 21.50", rendered)
+        self.assertNotIn("day_after=", rendered)
+        self.assertNotIn("week_after=", rendered)
+
+
 class SyncRoutingTests(unittest.TestCase):
     def test_oncall_previous_week_does_not_receive_next_week_events(self):
         today = date(2026, 4, 7)
@@ -406,6 +512,18 @@ class PeekUiTests(unittest.TestCase):
             ui_peek._unique_display_headers(headers),
             ["Friday", "Friday (2)", "Friday (2) (2)", "Friday (3)"],
         )
+
+    def test_df_from_grid_uses_fallback_column_names_when_no_header_row_exists(self):
+        df = ui_peek._df_from_grid(
+            [
+                ["Alex Smith", "Open"],
+                ["Taylor Jones", ""],
+            ]
+        )
+
+        self.assertEqual(list(df.columns), ["Column 1", "Column 2"])
+        self.assertEqual(df.iloc[0].tolist(), ["Alex Smith", "Open"])
+        self.assertEqual(df.iloc[1].tolist(), ["Taylor Jones", ""])
 
 
 if __name__ == "__main__":
