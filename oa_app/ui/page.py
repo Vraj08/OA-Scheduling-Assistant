@@ -1044,7 +1044,10 @@ def _overtime_baseline_minutes(
     Baseline = raw scheduled minutes for the request week
                - approved callouts for that same week
                + approved pickups for that same week
-               + pending pickup requests for that same week.
+
+    Intentionally do not count other pending pickup requests here. Users expect
+    the overtime prompt to start from the same adjusted "current hours" total
+    shown in the sidebar, then add the pickup they are submitting now.
     """
     week_before_mins, per_day_before = _sum_minutes_sched(base_sched)
 
@@ -1056,13 +1059,6 @@ def _overtime_baseline_minutes(
         week_before_mins = max(0, week_before_mins - callout_week + pickup_week)
         for d in list(per_day_before.keys()):
             per_day_before[d] = max(0, int(per_day_before.get(d, 0)) - int(callout_day.get(d, 0)) + int(pickup_day.get(d, 0)))
-
-    pending_week, pending_day = _pending_pickup_minutes_for_week(
-        ss, approvals_rows, requester=requester, week_bounds=week_bounds
-    )
-    week_before_mins += pending_week
-    for d, mins in pending_day.items():
-        per_day_before[d] = int(per_day_before.get(d, 0)) + int(mins)
 
     return week_before_mins, per_day_before
 

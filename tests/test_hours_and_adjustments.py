@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from oa_app.services import approvals, callouts_db, pickups_db
 from oa_app.jobs import sync_swaps_to_sheets
-from oa_app.ui import schedule_query
+from oa_app.ui import page, schedule_query, ui_peek
 
 
 class _FakeQuery:
@@ -254,6 +254,61 @@ class ApprovalWorkflowTests(unittest.TestCase):
             )
 
 
+class OvertimeBaselineTests(unittest.TestCase):
+    def test_overtime_baseline_uses_adjusted_hours_from_approved_changes(self):
+        base_sched = {
+            "monday": {
+                "UNH": [("8:00 AM", "12:00 PM")],
+                "MC": [("1:00 PM", "3:00 PM")],
+            }
+        }
+
+        with patch.object(page.callouts_db, "supabase_callouts_enabled", return_value=True), patch.object(
+            page.pickups_db, "supabase_pickups_enabled", return_value=True
+        ), patch.object(
+            page,
+            "_approved_adjustment_minutes_for_week",
+            return_value=(60, {"monday": 60}, 120, {"monday": 120}),
+        ):
+            week_mins, per_day = page._overtime_baseline_minutes(
+                None,
+                requester="Alex Smith",
+                base_sched=base_sched,
+                approvals_rows=[],
+                week_bounds=(date(2026, 4, 12), date(2026, 4, 18)),
+            )
+
+        self.assertEqual(week_mins, 300)
+        self.assertEqual(per_day["monday"], 300)
+
+    def test_overtime_baseline_ignores_other_pending_pickups(self):
+        base_sched = {"monday": {"UNH": [("8:00 AM", "12:00 PM")]}}
+        pending_pickup = {
+            "Action": "pickup",
+            "Status": "PENDING",
+            "Requester": "Alex Smith",
+            "Day": "Monday",
+            "Start": "4:00 PM",
+            "End": "6:00 PM",
+            "Details": "target=Taylor | date=2026-04-13",
+            "Created": "2026-04-13T10:00:00-07:00",
+        }
+
+        with patch.object(page.callouts_db, "supabase_callouts_enabled", return_value=True), patch.object(
+            page.pickups_db, "supabase_pickups_enabled", return_value=True
+        ), patch.object(page, "_approved_adjustment_minutes_for_week", return_value=(0, {}, 0, {})):
+            week_mins, per_day = page._overtime_baseline_minutes(
+                None,
+                requester="Alex Smith",
+                base_sched=base_sched,
+                approvals_rows=[pending_pickup],
+                week_bounds=(date(2026, 4, 12), date(2026, 4, 18)),
+            )
+
+        self.assertEqual(week_mins, 240)
+        self.assertEqual(per_day["monday"], 240)
+
+
 class SyncRoutingTests(unittest.TestCase):
     def test_oncall_previous_week_does_not_receive_next_week_events(self):
         today = date(2026, 4, 7)
@@ -330,6 +385,27 @@ class SyncRoutingTests(unittest.TestCase):
         self.assertFalse(sync_swaps_to_sheets._should_auto_sync_worksheet(hidden_oncall))
         self.assertTrue(sync_swaps_to_sheets._should_auto_sync_worksheet(visible_mc))
         self.assertFalse(sync_swaps_to_sheets._should_auto_sync_worksheet(hidden_policy))
+
+
+class PeekUiTests(unittest.TestCase):
+    def test_df_from_grid_deduplicates_blank_and_repeated_headers(self):
+        df = ui_peek._df_from_grid(
+            [
+                ["", "Friday", "Friday", ""],
+                ["7:00 PM", "Alex Smith", "Taylor Jones", "Open"],
+            ]
+        )
+
+        self.assertEqual(list(df.columns), ["Column 1", "Friday", "Friday (2)", "Column 4"])
+        self.assertEqual(df.iloc[0].tolist(), ["7:00 PM", "Alex Smith", "Taylor Jones", "Open"])
+
+    def test_unique_display_headers_avoids_suffix_collisions(self):
+        headers = ["Friday", "Friday", "Friday (2)", "Friday"]
+
+        self.assertEqual(
+            ui_peek._unique_display_headers(headers),
+            ["Friday", "Friday (2)", "Friday (2) (2)", "Friday (3)"],
+        )
 
 
 if __name__ == "__main__":

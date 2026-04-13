@@ -8,6 +8,25 @@ from ..config import ONCALL_MAX_COLS, ONCALL_MAX_ROWS
 from ..core.quotas import read_cols_exact, _safe_batch_get
 
 
+def _unique_display_headers(hdr):
+    """Make worksheet headers safe for Streamlit/PyArrow rendering."""
+    out = []
+    seen = set()
+    counts = {}
+
+    for idx, raw in enumerate(hdr or [], start=1):
+        base = str(raw or "").strip() or f"Column {idx}"
+        counts[base] = counts.get(base, 0) + 1
+        candidate = base if counts[base] == 1 else f"{base} ({counts[base]})"
+        while candidate in seen:
+            counts[base] += 1
+            candidate = f"{base} ({counts[base]})"
+        seen.add(candidate)
+        out.append(candidate)
+
+    return out
+
+
 def _df_from_grid(vals):
     """Convert a gspread batch_get grid (list of rows) into a dataframe."""
     if not vals:
@@ -18,7 +37,7 @@ def _df_from_grid(vals):
     if any((c or "").strip() for c in hdr):
         w = len(hdr)
         norm = [r + [""] * (w - len(r)) if len(r) < w else r[:w] for r in body]
-        return pd.DataFrame(norm, columns=hdr)
+        return pd.DataFrame(norm, columns=_unique_display_headers(hdr))
     return pd.DataFrame(vals)
 
 
@@ -127,14 +146,7 @@ def peek_oncall(ss):
         vals = _safe_batch_get(ws, [f"A1:{end_col}{ONCALL_MAX_ROWS}"])[0]
         if not vals:
             st.info("This On-Call worksheet is empty."); return
-        hdr = vals[0] if vals else []
-        body = vals[1:] if len(vals) > 1 else []
-        if any((c or "").strip() for c in hdr):
-            w = len(hdr)
-            norm = [r + [""] * (w - len(r)) if len(r) < w else r[:w] for r in body]
-            df = pd.DataFrame(norm, columns=hdr)
-        else:
-            df = pd.DataFrame(vals)
+        df = _df_from_grid(vals)
         st.dataframe(df, height=520, use_container_width=True)
 
 def peek_oncall_single(ss, title: str):
@@ -151,14 +163,6 @@ def peek_oncall_single(ss, title: str):
         if not vals:
             st.info("This On-Call worksheet is empty."); return
 
-        hdr = vals[0] if vals else []
-        body = vals[1:] if len(vals) > 1 else []
-
-        if any((c or "").strip() for c in hdr):
-            w = len(hdr)
-            norm = [r + [""] * (w - len(r)) if len(r) < w else r[:w] for r in body]
-            df = pd.DataFrame(norm, columns=hdr)
-        else:
-            df = pd.DataFrame(vals)
+        df = _df_from_grid(vals)
 
         st.dataframe(df, height=520, use_container_width=True)
