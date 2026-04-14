@@ -476,53 +476,15 @@ def _fetch_grid_with_formats(
     max_cols: int = ONCALL_MAX_COLS,
 ) -> tuple[list[list[str]], list[list[dict | None]]]:
     """Return bounded worksheet values + background colors from gridData."""
-    import gspread.utils as a1
+    from ..ui import pickup_scan
 
-    end_a1 = a1.rowcol_to_a1(int(max_rows), int(max_cols))
-    rng = _sheet_a1(ws.title, f"A1:{end_a1}")
-    meta = with_backoff(
-        ws.spreadsheet.fetch_sheet_metadata,
-        params={"includeGridData": True, "ranges": [rng]},
+    grid, bg_grid = pickup_scan._fetch_griddata(
+        ws.spreadsheet,
+        ws.title,
+        max_rows=max_rows,
+        max_cols=max_cols,
     )
-
-    sheets = (meta or {}).get("sheets") or []
-    if not sheets:
-        return ([], [])
-    data = (sheets[0] or {}).get("data") or []
-    if not data:
-        return ([], [])
-
-    row_data = (data[0] or {}).get("rowData") or []
-    grid: list[list[str]] = []
-    bg_grid: list[list[dict | None]] = []
-
-    for rd in row_data[:max_rows]:
-        vals = (rd or {}).get("values") or []
-        row_txt: list[str] = []
-        row_bg: list[dict | None] = []
-        for c in range(max_cols):
-            cell = vals[c] if c < len(vals) and isinstance(vals[c], dict) else {}
-            v = cell.get("formattedValue")
-            if v is None:
-                u = cell.get("userEnteredValue")
-                if isinstance(u, dict):
-                    v = u.get("stringValue") or u.get("numberValue") or u.get("boolValue")
-            row_txt.append("" if v is None else str(v).strip())
-
-            fmt = cell.get("effectiveFormat") or cell.get("userEnteredFormat") or {}
-            bg = fmt.get("backgroundColor") if isinstance(fmt, dict) else None
-            if not isinstance(bg, dict):
-                bg_style = fmt.get("backgroundColorStyle") if isinstance(fmt, dict) else None
-                rgb = bg_style.get("rgbColor") if isinstance(bg_style, dict) else None
-                bg = rgb if isinstance(rgb, dict) else None
-            row_bg.append(bg if isinstance(bg, dict) else None)
-        grid.append(row_txt)
-        bg_grid.append(row_bg)
-
-    while len(grid) < max_rows:
-        grid.append([""] * max_cols)
-        bg_grid.append([None] * max_cols)
-    return (grid[:max_rows], bg_grid[:max_rows])
+    return (grid, bg_grid)
 
 
 def _bg_at(bg_grid: list[list[dict | None]], row: int, col: int) -> dict | None:
@@ -572,16 +534,20 @@ def _schedule_day_columns(
     bucket_start: date,
 ) -> dict[date, tuple[str, int]]:
     from ..actions import chat_callout
+    from ..ui import pickup_scan
 
     out: dict[date, tuple[str, int]] = {}
     kind = _campus_key_for_sheet_title(ws_title)
+    generic_day_cols = pickup_scan._day_cols_from_grid(grid) if kind != "ONCALL" else {}
     for idx, day_canon in enumerate(DAY_ORDER):
         col = None
         try:
             if kind == "ONCALL":
                 col = chat_callout._find_oncall_day_col(grid, day_canon, ws_title)
             else:
-                col = chat_callout._find_day_col(grid, day_canon)
+                col = generic_day_cols.get(day_canon)
+                if col is None:
+                    col = chat_callout._find_day_col(grid, day_canon)
         except Exception:
             col = None
         if col is None:
@@ -1032,7 +998,7 @@ def _apply_grid_colors(
     except Exception as e:
         return [f"grid_fetch_failed:{ws_title}:{e}"]
     if not grid:
-        return []
+        return [f"grid_fetch_empty:{ws_title}"]
 
     bucket_start, _bucket_end, _allow_future = _bucket_window_for_sheet(ws_title, today=today)
     day_cols = _schedule_day_columns(grid, ws_title=ws_title, bucket_start=bucket_start)
