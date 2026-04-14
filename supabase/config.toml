@@ -1,0 +1,2 @@
+[functions.notify-approvals]
+verify_jwt = false
