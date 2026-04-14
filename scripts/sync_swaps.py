@@ -63,7 +63,7 @@ def main() -> None:
     # Local import so running this file doesn't require Streamlit.
     from oa_app.jobs.sync_swaps_to_sheets import sync_swaps_to_sheets
 
-    res = sync_swaps_to_sheets(ss, sb)
+    res = sync_swaps_to_sheets(ss, sb, apply_grid_colors=True)
     print(json.dumps(res, indent=2))
 
 

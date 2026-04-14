@@ -29,6 +29,8 @@ import re
 
 import gspread
 
+from ..config import ONCALL_MAX_COLS, ONCALL_MAX_ROWS
+from ..core.quotas import bump_ws_version
 from ..integrations.gspread_io import with_backoff
 from ..core.sheets_sections import Section, blanks, compute_section, pad_rows
 from ..core.week_range import la_today, week_range_from_title
@@ -55,6 +57,7 @@ HDR_FUTURE_ALIASES = [
 # Colors (Sheets API RGB in 0..1)
 ORANGE = {"red": 1.0, "green": 0.65, "blue": 0.0}
 RED = {"red": 0.95, "green": 0.25, "blue": 0.25}
+WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
 # Swap-section column fills (match the workbook template palette)
 #   - "Light orange 3" (weekly swaps column)
@@ -71,6 +74,7 @@ SWAP_FUTURE_BG = {"red": 182 / 255, "green": 215 / 255, "blue": 168 / 255}  # B6
 KEY_WEEKLY_COL = 52  # AZ
 KEY_FUTURE_COL = 53  # BA
 SECTION_MAX_ROWS = 200
+DAY_ORDER = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
 
 def _ensure_ws_dimensions(ws: gspread.Worksheet, *, min_rows: int, min_cols: int) -> None:
     """Ensure the worksheet has at least (min_rows, min_cols) grid size.
@@ -337,7 +341,7 @@ def _clear_format(ws: gspread.Worksheet, section: Section) -> None:
                     "endColumnIndex": section.start_col - 1 + section.num_cols,
                 },
                 "cell": {
-                    "userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}},
+                    "userEnteredFormat": {"backgroundColor": WHITE},
                 },
                 "fields": "userEnteredFormat.backgroundColor",
             }
@@ -428,6 +432,310 @@ def _format_rows_at(ws: gspread.Worksheet, *, col: int, rows: list[int], colors:
             }
         )
     with_backoff(ws.spreadsheet.batch_update, {'requests': requests})
+
+
+def _format_cells_at(ws: gspread.Worksheet, coords: list[tuple[int, int]], rgb: dict) -> None:
+    """Apply background color to arbitrary 0-based cell coords."""
+    if not coords:
+        return
+    requests: list[dict] = []
+    for r0, c0 in coords:
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": r0,
+                        "endRowIndex": r0 + 1,
+                        "startColumnIndex": c0,
+                        "endColumnIndex": c0 + 1,
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": rgb}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }
+        )
+    with_backoff(ws.spreadsheet.batch_update, {"requests": requests})
+
+
+def _dedupe_coords(coords: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for coord in coords:
+        if coord in seen:
+            continue
+        seen.add(coord)
+        out.append(coord)
+    return out
+
+
+def _fetch_grid_with_formats(
+    ws: gspread.Worksheet,
+    *,
+    max_rows: int = ONCALL_MAX_ROWS,
+    max_cols: int = ONCALL_MAX_COLS,
+) -> tuple[list[list[str]], list[list[dict | None]]]:
+    """Return bounded worksheet values + background colors from gridData."""
+    import gspread.utils as a1
+
+    end_a1 = a1.rowcol_to_a1(int(max_rows), int(max_cols))
+    rng = _sheet_a1(ws.title, f"A1:{end_a1}")
+    meta = with_backoff(
+        ws.spreadsheet.fetch_sheet_metadata,
+        params={"includeGridData": True, "ranges": [rng]},
+    )
+
+    sheets = (meta or {}).get("sheets") or []
+    if not sheets:
+        return ([], [])
+    data = (sheets[0] or {}).get("data") or []
+    if not data:
+        return ([], [])
+
+    row_data = (data[0] or {}).get("rowData") or []
+    grid: list[list[str]] = []
+    bg_grid: list[list[dict | None]] = []
+
+    for rd in row_data[:max_rows]:
+        vals = (rd or {}).get("values") or []
+        row_txt: list[str] = []
+        row_bg: list[dict | None] = []
+        for c in range(max_cols):
+            cell = vals[c] if c < len(vals) and isinstance(vals[c], dict) else {}
+            v = cell.get("formattedValue")
+            if v is None:
+                u = cell.get("userEnteredValue")
+                if isinstance(u, dict):
+                    v = u.get("stringValue") or u.get("numberValue") or u.get("boolValue")
+            row_txt.append("" if v is None else str(v).strip())
+
+            fmt = cell.get("effectiveFormat") or cell.get("userEnteredFormat") or {}
+            bg = fmt.get("backgroundColor") if isinstance(fmt, dict) else None
+            if not isinstance(bg, dict):
+                bg_style = fmt.get("backgroundColorStyle") if isinstance(fmt, dict) else None
+                rgb = bg_style.get("rgbColor") if isinstance(bg_style, dict) else None
+                bg = rgb if isinstance(rgb, dict) else None
+            row_bg.append(bg if isinstance(bg, dict) else None)
+        grid.append(row_txt)
+        bg_grid.append(row_bg)
+
+    while len(grid) < max_rows:
+        grid.append([""] * max_cols)
+        bg_grid.append([None] * max_cols)
+    return (grid[:max_rows], bg_grid[:max_rows])
+
+
+def _bg_at(bg_grid: list[list[dict | None]], row: int, col: int) -> dict | None:
+    if row < 0 or col < 0:
+        return None
+    if row >= len(bg_grid):
+        return None
+    rr = bg_grid[row]
+    if col >= len(rr):
+        return None
+    return rr[col]
+
+
+def _is_redish(bg: dict | None) -> bool:
+    if not bg:
+        return False
+    r = float(bg.get("red", 0.0) or 0.0)
+    g = float(bg.get("green", 0.0) or 0.0)
+    b = float(bg.get("blue", 0.0) or 0.0)
+    if r >= 0.93 and g >= 0.93 and b >= 0.93:
+        return False
+    if (r >= 0.78) and (g <= 0.55) and (b <= 0.55):
+        return True
+    if r >= 0.85 and g >= 0.55 and b >= 0.55:
+        if (r - g) >= 0.06 and (r - b) >= 0.06:
+            return True
+    return False
+
+
+def _is_orangeish(bg: dict | None) -> bool:
+    if not bg:
+        return False
+    r = float(bg.get("red", 0.0) or 0.0)
+    g = float(bg.get("green", 0.0) or 0.0)
+    b = float(bg.get("blue", 0.0) or 0.0)
+    return (r >= 0.90) and (g >= 0.50) and (b <= 0.20)
+
+
+def _local_naive(dt: datetime) -> datetime:
+    return _to_la(dt).replace(tzinfo=None)
+
+
+def _schedule_day_columns(
+    grid: list[list[str]],
+    *,
+    ws_title: str,
+    bucket_start: date,
+) -> dict[date, tuple[str, int]]:
+    from ..actions import chat_callout
+
+    out: dict[date, tuple[str, int]] = {}
+    kind = _campus_key_for_sheet_title(ws_title)
+    for idx, day_canon in enumerate(DAY_ORDER):
+        col = None
+        try:
+            if kind == "ONCALL":
+                col = chat_callout._find_oncall_day_col(grid, day_canon, ws_title)
+            else:
+                col = chat_callout._find_day_col(grid, day_canon)
+        except Exception:
+            col = None
+        if col is None:
+            continue
+        out[bucket_start + timedelta(days=idx)] = (day_canon, col)
+    return out
+
+
+def _lane_coords_for_day(
+    grid: list[list[str]],
+    *,
+    ws_title: str,
+    day_col: int,
+) -> list[tuple[int, int]]:
+    from ..actions import chat_callout
+
+    coords: list[tuple[int, int]] = []
+    kind = _campus_key_for_sheet_title(ws_title)
+
+    if kind == "ONCALL":
+        label_rows: list[int] = []
+        for r in range(len(grid)):
+            v0 = (grid[r][0] if len(grid[r]) > 0 else "") or ""
+            vd = (grid[r][day_col] if day_col < len(grid[r]) else "") or ""
+            if chat_callout._RANGE_RE.match(str(v0).strip()) or chat_callout._RANGE_RE.match(str(vd).strip()):
+                label_rows.append(r)
+        if not label_rows:
+            return []
+        label_rows.append(len(grid))
+        for i in range(len(label_rows) - 1):
+            r_label = label_rows[i]
+            r_next = label_rows[i + 1]
+            for rr in range(r_label + 1, r_next):
+                if rr >= len(grid) or day_col >= len(grid[rr]):
+                    continue
+                if str(grid[rr][day_col] or "").strip():
+                    coords.append((rr, day_col))
+        return coords
+
+    time_rows: list[int] = []
+    for r, row in enumerate(grid):
+        col0 = (row[0] if len(row) >= 1 else "") or ""
+        if chat_callout._TIME_CELL_RE.match(col0) and chat_callout._parse_time_cell(col0):
+            time_rows.append(r)
+    if not time_rows:
+        return []
+    time_rows.append(len(grid))
+    for i in range(len(time_rows) - 1):
+        r0 = time_rows[i]
+        r1 = time_rows[i + 1]
+        for rr in range(r0 + 1, r1):
+            if rr >= len(grid) or day_col >= len(grid[rr]):
+                continue
+            if str(grid[rr][day_col] or "").strip():
+                coords.append((rr, day_col))
+    return coords
+
+
+def _find_schedule_coords(
+    grid: list[list[str]],
+    *,
+    ws_title: str,
+    target_name: str,
+    day_canon: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> list[tuple[int, int]]:
+    from ..actions import chat_callout
+
+    kind = _campus_key_for_sheet_title(ws_title)
+    if kind == "ONCALL":
+        c0 = chat_callout._find_oncall_day_col(grid, day_canon, ws_title)
+    else:
+        c0 = chat_callout._find_day_col(grid, day_canon)
+    if c0 is None:
+        return []
+
+    sdt = _local_naive(start_dt)
+    edt = _local_naive(end_dt)
+    if edt <= sdt:
+        edt = edt + timedelta(days=1)
+
+    target_coords: list[tuple[int, int]] = []
+
+    if kind == "ONCALL":
+        def _overlaps(a0: datetime, a1: datetime, b0: datetime, b1: datetime) -> bool:
+            return (a0 < b1) and (a1 > b0)
+
+        label_rows: list[int] = []
+        for r in range(len(grid)):
+            v0 = (grid[r][0] if len(grid[r]) > 0 else "") or ""
+            vd = (grid[r][c0] if c0 < len(grid[r]) else "") or ""
+            if chat_callout._RANGE_RE.match(str(v0).strip()) or chat_callout._RANGE_RE.match(str(vd).strip()):
+                label_rows.append(r)
+        if not label_rows:
+            return []
+        label_rows.append(len(grid))
+
+        for i in range(len(label_rows) - 1):
+            r_label = label_rows[i]
+            r_next = label_rows[i + 1]
+            shared_v0 = (grid[r_label][0] if len(grid[r_label]) > 0 else "") or ""
+            day_v = (grid[r_label][c0] if c0 < len(grid[r_label]) else "") or ""
+            range_txt = day_v if chat_callout._RANGE_RE.match(str(day_v).strip()) else shared_v0
+            m = chat_callout._RANGE_RE.match(str(range_txt).strip()) if range_txt else None
+            if not m:
+                continue
+            bs = chat_callout._parse_time_cell(m.group(1))
+            be = chat_callout._parse_time_cell(m.group(2))
+            if not bs or not be:
+                continue
+            bs_dt = datetime.combine(sdt.date(), bs.time())
+            be_dt = datetime.combine(sdt.date(), be.time())
+            if be_dt <= bs_dt:
+                be_dt = be_dt + timedelta(days=1)
+            if not _overlaps(bs_dt, be_dt, sdt, edt):
+                continue
+            for rr in range(r_label + 1, r_next):
+                if rr >= len(grid) or c0 >= len(grid[rr]):
+                    continue
+                v = (grid[rr][c0] if c0 < len(grid[rr]) else "") or ""
+                if chat_callout._cell_has_name_loose(v, target_name):
+                    target_coords.append((rr, c0))
+        return _dedupe_coords(target_coords)
+
+    time_rows: list[int] = []
+    for r, row in enumerate(grid):
+        col0 = (row[0] if len(row) >= 1 else "") or ""
+        if chat_callout._TIME_CELL_RE.match(col0) and chat_callout._parse_time_cell(col0):
+            time_rows.append(r)
+    if not time_rows:
+        return []
+    time_rows.append(len(grid))
+
+    bands: dict[str, tuple[int, int]] = {}
+    for i in range(len(time_rows) - 1):
+        r0 = time_rows[i]
+        r1 = time_rows[i + 1]
+        start_label = (grid[r0][0] if len(grid[r0]) >= 1 else "") or ""
+        dt = chat_callout._parse_time_cell(start_label)
+        if dt:
+            bands[dt.strftime("%I:%M %p")] = (r0, r1)
+
+    for seg_s, _seg_e in chat_callout._range_to_slots(sdt, edt):
+        lab = seg_s.strftime("%I:%M %p")
+        if lab not in bands:
+            continue
+        r0, r1 = bands[lab]
+        for rr in range(r0 + 1, r1):
+            v = (grid[rr][c0] if (rr < len(grid) and c0 < len(grid[rr])) else "") or ""
+            if chat_callout._cell_has_name_loose(v, target_name):
+                target_coords.append((rr, c0))
+                break
+    return _dedupe_coords(target_coords)
 
 
 def _upsert_section(
@@ -703,32 +1011,48 @@ def _query_all_from(supabase, table: str, *, start_date: date) -> list[dict]:
 
 
 def _apply_grid_colors(
-    ss: gspread.Spreadsheet,
-    ws_title: str,
+    ws: gspread.Worksheet,
     *,
     callouts: list[dict],
     pickups: list[dict],
     today: date,
 ) -> list[str]:
-    """Color schedule grid for events that belong on this sheet (best-effort)."""
+    """Reconcile schedule colors for this sheet from Supabase truth.
+
+    Workflow:
+      1) Clear stale red/orange callout colors in the sheet's weekly bucket.
+      2) Repaint active uncovered callouts red.
+      3) Repaint active pickups orange so covered segments win.
+    """
     errors: list[str] = []
+    ws_title = ws.title
+
     try:
-        import streamlit as st
-        from ..actions import chat_callout
+        grid, bg_grid = _fetch_grid_with_formats(ws)
     except Exception as e:
-        return [f"grid_color_import_failed: {e}"]
+        return [f"grid_fetch_failed:{ws_title}:{e}"]
+    if not grid:
+        return []
 
-    # Color red uncovered callout segments first, then orange pickups.
-    # This keeps "covered" segments orange.
+    bucket_start, _bucket_end, _allow_future = _bucket_window_for_sheet(ws_title, today=today)
+    day_cols = _schedule_day_columns(grid, ws_title=ws_title, bucket_start=bucket_start)
 
-    # Build pickups by target for coverage math.
+    clear_coords: list[tuple[int, int]] = []
+    for day_d, (_day_canon, col) in day_cols.items():
+        if _bucket_label_for_sheet_event(ws_title, day_d, today=today) != "weekly":
+            continue
+        for rr, cc in _lane_coords_for_day(grid, ws_title=ws_title, day_col=col):
+            bg = _bg_at(bg_grid, rr, cc)
+            if _is_redish(bg) or _is_orangeish(bg):
+                clear_coords.append((rr, cc))
+
     pickups_by_target: dict[tuple[date, str], list[tuple[int, int]]] = {}
     for p in pickups:
         try:
             d = date.fromisoformat(str(p.get("event_date")))
         except Exception:
             continue
-        if not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
+        if d < today or not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
             continue
         sdt = _parse_dt(p.get("shift_start_at"))
         edt = _parse_dt(p.get("shift_end_at"))
@@ -739,13 +1063,13 @@ def _apply_grid_colors(
             continue
         pickups_by_target.setdefault((d, target_k), []).append((_mins(sdt), _mins(edt)))
 
-    # Callouts: color uncovered segments red.
+    red_coords: list[tuple[int, int]] = []
     for c in callouts:
         try:
             d = date.fromisoformat(str(c.get("event_date")))
         except Exception:
             continue
-        if not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
+        if d < today or not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
             continue
         sdt = _parse_dt(c.get("shift_start_at"))
         edt = _parse_dt(c.get("shift_end_at"))
@@ -756,62 +1080,76 @@ def _apply_grid_colors(
         if not caller_k:
             continue
 
+        base_local = _local_naive(sdt)
         base_interval = (_mins(sdt), _mins(edt))
         covers = pickups_by_target.get((d, caller_k), [])
         uncovered = _subtract_many(base_interval, covers)
-        if not uncovered:
-            continue
-
-        day_canon = d.strftime("%A").lower()
         for a, b in uncovered:
-            # Convert minute intervals into times.
-            a_t = time(a // 60 % 24, a % 60)
-            b_min2 = 0 if b == 24 * 60 else b
-            b_t = time(b_min2 // 60 % 24, b_min2 % 60)
-            try:
-                chat_callout.handle_callout(
-                    st,
-                    ss,
-                    None,
-                    canon_target_name=caller,
-                    campus_title=ws_title,
-                    day=day_canon,
-                    start=a_t,
-                    end=b_t,
-                    covered_by=None,
-                )
-            except Exception as e:
-                errors.append(f"callout_color_failed:{ws_title}:{caller}:{d}:{a}-{b}:{e}")
+            seg_s = base_local.replace(hour=a // 60 % 24, minute=a % 60, second=0, microsecond=0)
+            b_min = 0 if b == 24 * 60 else b
+            seg_e = base_local.replace(hour=b_min // 60 % 24, minute=b_min % 60, second=0, microsecond=0)
+            if b == 24 * 60 or seg_e <= seg_s:
+                seg_e = seg_e + timedelta(days=1)
+            coords = _find_schedule_coords(
+                grid,
+                ws_title=ws_title,
+                target_name=caller,
+                day_canon=d.strftime("%A").lower(),
+                start_dt=seg_s,
+                end_dt=seg_e,
+            )
+            if coords:
+                red_coords.extend(coords)
+            else:
+                errors.append(f"callout_color_target_not_found:{ws_title}:{caller}:{d}:{a}-{b}")
 
-    # Pickups: color target segments orange.
+    orange_coords: list[tuple[int, int]] = []
     for p in pickups:
         try:
             d = date.fromisoformat(str(p.get("event_date")))
         except Exception:
             continue
-        if not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
+        if d < today or not _should_apply_grid_color_for_sheet(ws_title, d, today=today):
             continue
         sdt = _parse_dt(p.get("shift_start_at"))
         edt = _parse_dt(p.get("shift_end_at"))
         if not (sdt and edt):
             continue
         target = str(p.get("target_name", "")).strip()
-        picker = str(p.get("picker_name", "")).strip()
-        day_canon = d.strftime("%A").lower()
-        try:
-            chat_callout.handle_callout(
-                st,
-                ss,
-                None,
-                canon_target_name=target,
-                campus_title=ws_title,
-                day=day_canon,
-                start=_to_la(sdt).time(),
-                end=_to_la(edt).time(),
-                covered_by=picker or "cover",
-            )
-        except Exception as e:
-            errors.append(f"pickup_color_failed:{ws_title}:{target}:{d}:{e}")
+        if not target:
+            continue
+        coords = _find_schedule_coords(
+            grid,
+            ws_title=ws_title,
+            target_name=target,
+            day_canon=d.strftime("%A").lower(),
+            start_dt=sdt,
+            end_dt=edt,
+        )
+        if coords:
+            orange_coords.extend(coords)
+        else:
+            errors.append(f"pickup_color_target_not_found:{ws_title}:{target}:{d}")
+
+    changed = False
+    clear_coords = _dedupe_coords(clear_coords)
+    red_coords = _dedupe_coords(red_coords)
+    orange_coords = _dedupe_coords(orange_coords)
+
+    try:
+        if clear_coords:
+            _format_cells_at(ws, clear_coords, WHITE)
+            changed = True
+        if red_coords:
+            _format_cells_at(ws, red_coords, RED)
+            changed = True
+        if orange_coords:
+            _format_cells_at(ws, orange_coords, ORANGE)
+            changed = True
+        if changed:
+            bump_ws_version(ws)
+    except Exception as e:
+        errors.append(f"grid_color_batch_failed:{ws_title}:{e}")
 
     return errors
 
@@ -891,11 +1229,10 @@ def sync_swaps_to_sheets(
         "grid_errors": [],
     }
 
-    # Recoloring the main schedule grid requires additional reads. To protect
-    # Sheets quotas, only allow it when syncing a single worksheet.
-    do_grid = bool(apply_grid_colors and len(targets) == 1)
-    if apply_grid_colors and not do_grid:
-        summary["grid_errors"].append({"error": "apply_grid_colors_requires_single_sheet"})
+    # Optional grid reconciliation pass:
+    #   - clears stale red/orange schedule cells in the weekly bucket
+    #   - repaints active weekly callouts/pickups from Supabase
+    do_grid = bool(apply_grid_colors)
 
     for ws in targets:
         weekly_sec, future_sec = sections_by_title[ws.title]
@@ -1016,7 +1353,7 @@ def sync_swaps_to_sheets(
             continue
 
         if do_grid:
-            errs = _apply_grid_colors(ss, ws.title, callouts=c_rows, pickups=p_rows, today=today)
+            errs = _apply_grid_colors(ws, callouts=c_rows, pickups=p_rows, today=today)
             summary["grid_errors"].extend(errs)
 
     # In strict single-sheet mode (approval path), bubble failures so the UI can

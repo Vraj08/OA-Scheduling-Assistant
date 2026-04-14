@@ -2509,7 +2509,7 @@ def run() -> None:
                     else:
                         try:
                             sb = get_supabase()
-                            res = sync_swaps_to_sheets(ss, sb)
+                            res = sync_swaps_to_sheets(ss, sb, apply_grid_colors=True)
                             st.session_state["_LAST_SWAP_SYNC_TS"] = now_ts
                             sheet_errs = res.get("sheet_errors") or []
                             msg = (
@@ -2758,7 +2758,7 @@ def run() -> None:
                             sb,
                             worksheet=ws_obj,
                             sheet_title=campus_ws_title,
-                            apply_grid_colors=(campus_key == "ONCALL"),
+                            apply_grid_colors=True,
                         )
                         sheet_errs = res.get("sheet_errors") or []
                         if sheet_errs:
@@ -2876,7 +2876,7 @@ def run() -> None:
                             sb,
                             worksheet=ws_obj,
                             sheet_title=campus_ws_title,
-                            apply_grid_colors=(campus_key == "ONCALL"),
+                            apply_grid_colors=True,
                         )
                         sheet_errs = res.get("sheet_errors") or []
                         if sheet_errs:
@@ -3777,7 +3777,7 @@ def run() -> None:
                                     sb,
                                     worksheet=ws_obj,
                                     sheet_title=active_tab,
-                                    apply_grid_colors=(campus_key == "ONCALL"),
+                                    apply_grid_colors=True,
                                 )
                             except Exception as e:
                                 st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")

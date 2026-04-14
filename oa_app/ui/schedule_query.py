@@ -777,7 +777,7 @@ def render_user_schedule_markdown(
       • Weekly Summary table (optional)
       • One compact table per day that has shifts
     """
-    day_order = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+    day_order = list(_WEEK_ORDER_7)
     blocks: List[str] = []
 
     if include_weekly_summary:
@@ -817,7 +817,7 @@ _SOURCE_COLOR = {
     "On-Call": "#F59E0B",  # amber-500
 }
 
-_DAY_ORDER = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+_DAY_ORDER = list(_WEEK_ORDER_7)
 _DAY_TITLE = {d: d.title() for d in _DAY_ORDER}
 
 def _parse_time_for_dt(t: str) -> datetime:
@@ -908,16 +908,16 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
     Plot-only: PlotStartDT, PlotEndDT
     """
     rows = []
-    today = date.today()
-    anchor_mon = today - timedelta(days=(today.weekday() % 7))
+    today = week_range_mod.la_today()
+    anchor_sun = today - timedelta(days=((today.weekday() + 1) % 7))
     anchors = {
-        "monday":    anchor_mon,
-        "tuesday":   anchor_mon + timedelta(days=1),
-        "wednesday": anchor_mon + timedelta(days=2),
-        "thursday":  anchor_mon + timedelta(days=3),
-        "friday":    anchor_mon + timedelta(days=4),
-        "saturday":  anchor_mon + timedelta(days=5),
-        "sunday":    anchor_mon + timedelta(days=6),
+        "sunday":    anchor_sun,
+        "monday":    anchor_sun + timedelta(days=1),
+        "tuesday":   anchor_sun + timedelta(days=2),
+        "wednesday": anchor_sun + timedelta(days=3),
+        "thursday":  anchor_sun + timedelta(days=4),
+        "friday":    anchor_sun + timedelta(days=5),
+        "saturday":  anchor_sun + timedelta(days=6),
     }
 
     for day in _DAY_ORDER:
@@ -959,7 +959,7 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
 def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Schedule"):
     """
     Calendar view:
-      • X-axis: Days (Mon → Sun) with day+date labels shown at the top
+      • X-axis: Days (Sun → Sat) with day+date labels shown at the top
       • Y-axis: Time (7:00 AM → 12:00 AM) in 30-min increments
       • Narrow colored blocks with centered labels: time range + source
       • Vertical separator lines between days
@@ -974,7 +974,7 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
         st.info("📈 Install Plotly to enable the pictorial timeline: `pip install plotly`")
         return
 
-    # ---- Days present (Mon→Sun order) ----
+    # ---- Days present (Sun→Sat order) ----
     day_titles = [_DAY_TITLE[d] for d in _DAY_ORDER]
     days_present = [d for d in day_titles if d in df["Day"].unique().tolist()]
     if not days_present:

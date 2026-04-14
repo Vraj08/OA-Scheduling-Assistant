@@ -52,6 +52,51 @@ class _FakeApprovalSheet:
         self.updated_ranges.append((range_name, values))
 
 
+class _FakeGridSpreadsheet:
+    def __init__(self, grid, bg_grid):
+        self.grid = grid
+        self.bg_grid = bg_grid
+        self.batch_requests = []
+
+    def fetch_sheet_metadata(self, params=None):
+        row_data = []
+        max_cols = max((len(r) for r in self.grid), default=0)
+        for r, row in enumerate(self.grid):
+            values = []
+            for c in range(max_cols):
+                cell = {}
+                txt = row[c] if c < len(row) else ""
+                if txt != "":
+                    cell["formattedValue"] = txt
+                bg = None
+                if r < len(self.bg_grid) and c < len(self.bg_grid[r]):
+                    bg = self.bg_grid[r][c]
+                if bg:
+                    cell["effectiveFormat"] = {"backgroundColor": dict(bg)}
+                values.append(cell)
+            row_data.append({"values": values})
+        return {"sheets": [{"data": [{"rowData": row_data}]}]}
+
+    def batch_update(self, body):
+        self.batch_requests.append(body)
+
+
+class _FakeGridWorksheet:
+    def __init__(self, *, title, grid, bg_grid, sheet_id=1, hidden=False):
+        self.title = title
+        self.id = sheet_id
+        self._properties = {"hidden": hidden}
+        self.spreadsheet = _FakeGridSpreadsheet(grid, bg_grid)
+
+
+class _FakeWorkbook:
+    def __init__(self, worksheets):
+        self._worksheets = worksheets
+
+    def worksheets(self):
+        return list(self._worksheets)
+
+
 class ScheduleQueryHoursTests(unittest.TestCase):
     def test_unh_mc_counts_half_hours_when_headers_are_below_top_row(self):
         grid = [
@@ -103,6 +148,29 @@ class ScheduleQueryHoursTests(unittest.TestCase):
 
         self.assertEqual(len(blocks.get("monday", [])), 1)
         self.assertEqual(schedule_query._mins_between(*blocks["monday"][0]), 300)
+
+    def test_build_schedule_dataframe_anchors_week_sunday_through_saturday(self):
+        user_sched = {
+            "sunday": {"UNH": [("8:00 AM", "10:00 AM")], "MC": [], "On-Call": []},
+            "saturday": {"UNH": [], "MC": [("1:00 PM", "3:00 PM")], "On-Call": []},
+        }
+
+        with patch.object(schedule_query.week_range_mod, "la_today", return_value=date(2026, 4, 14)):
+            df = schedule_query.build_schedule_dataframe(user_sched)
+
+        self.assertEqual(df["Day"].tolist(), ["Sunday", "Saturday"])
+        self.assertEqual(df["Date"].tolist(), [date(2026, 4, 12), date(2026, 4, 18)])
+
+    def test_render_user_schedule_markdown_lists_sunday_before_monday(self):
+        rendered = schedule_query.render_user_schedule_markdown(
+            {
+                "monday": {"UNH": [("8:00 AM", "10:00 AM")], "MC": [], "On-Call": []},
+                "sunday": {"UNH": [], "MC": [("1:00 PM", "3:00 PM")], "On-Call": []},
+            },
+            include_weekly_summary=False,
+        )
+
+        self.assertLess(rendered.index("### Sunday"), rendered.index("### Monday"))
 
 
 class AdjustmentDurationTests(unittest.TestCase):
@@ -579,6 +647,76 @@ class SyncRoutingTests(unittest.TestCase):
         self.assertFalse(sync_swaps_to_sheets._should_auto_sync_worksheet(hidden_oncall))
         self.assertTrue(sync_swaps_to_sheets._should_auto_sync_worksheet(visible_mc))
         self.assertFalse(sync_swaps_to_sheets._should_auto_sync_worksheet(hidden_policy))
+
+
+class SyncGridReconcileTests(unittest.TestCase):
+    def test_apply_grid_colors_clears_stale_past_cells_and_repaints_future_weekly_callout(self):
+        grid = [
+            ["Time", "Sunday", "Monday", "Wednesday"],
+            ["7:00 AM", "", "", ""],
+            ["", "OA: Pat", "OA: Alex Smith", "OA: Alex Smith"],
+            ["7:30 AM", "", "", ""],
+            ["", "OA: Pat", "OA: Alex Smith", "OA: Alex Smith"],
+        ]
+        bg_grid = [
+            [None, None, None, None],
+            [None, None, None, None],
+            [None, None, sync_swaps_to_sheets.RED, None],
+            [None, None, None, None],
+            [None, None, sync_swaps_to_sheets.ORANGE, None],
+        ]
+        ws = _FakeGridWorksheet(title="MC (OA and GOAs)", grid=grid, bg_grid=bg_grid)
+        callouts = [
+            {
+                "event_date": "2026-04-15",
+                "shift_start_at": "2026-04-15T07:00:00-07:00",
+                "shift_end_at": "2026-04-15T08:00:00-07:00",
+                "caller_name": "Alex Smith",
+                "campus": "MC",
+            }
+        ]
+
+        with patch.object(sync_swaps_to_sheets, "bump_ws_version"):
+            errs = sync_swaps_to_sheets._apply_grid_colors(
+                ws,
+                callouts=callouts,
+                pickups=[],
+                today=date(2026, 4, 14),
+            )
+
+        self.assertEqual(errs, [])
+        painted = []
+        for body in ws.spreadsheet.batch_requests:
+            for req in body.get("requests", []):
+                rep = req.get("repeatCell", {})
+                rng = rep.get("range", {})
+                color = (((rep.get("cell") or {}).get("userEnteredFormat") or {}).get("backgroundColor") or {})
+                painted.append((rng.get("startRowIndex"), rng.get("startColumnIndex"), color))
+
+        self.assertIn((2, 2, sync_swaps_to_sheets.WHITE), painted)
+        self.assertIn((4, 2, sync_swaps_to_sheets.WHITE), painted)
+        self.assertIn((2, 3, sync_swaps_to_sheets.RED), painted)
+        self.assertIn((4, 3, sync_swaps_to_sheets.RED), painted)
+
+    def test_sync_swaps_manual_multi_sheet_sync_runs_grid_reconcile_for_each_target(self):
+        ws_mc = _FakeGridWorksheet(title="MC (OA and GOAs)", grid=[[""]], bg_grid=[[None]], sheet_id=1)
+        ws_oncall = _FakeGridWorksheet(title="On Call 4/12 - 4/18", grid=[[""]], bg_grid=[[None]], sheet_id=2)
+        ss = _FakeWorkbook([ws_mc, ws_oncall])
+
+        with patch.object(sync_swaps_to_sheets, "la_today", return_value=date(2026, 4, 14)), patch.object(
+            sync_swaps_to_sheets, "_ensure_fixed_headers", return_value=(SimpleNamespace(), SimpleNamespace())
+        ), patch.object(sync_swaps_to_sheets, "_query_all_from", return_value=[]), patch.object(
+            sync_swaps_to_sheets, "_upsert_section", return_value=0
+        ), patch.object(sync_swaps_to_sheets, "_apply_grid_colors", return_value=[]) as apply_grid:
+            res = sync_swaps_to_sheets.sync_swaps_to_sheets(
+                ss,
+                supabase=object(),
+                apply_grid_colors=True,
+            )
+
+        self.assertEqual(apply_grid.call_count, 2)
+        self.assertEqual(sorted(res["sheets_updated"]), ["MC (OA and GOAs)", "On Call 4/12 - 4/18"])
+        self.assertEqual(res["grid_errors"], [])
 
 
 class PeekUiTests(unittest.TestCase):
