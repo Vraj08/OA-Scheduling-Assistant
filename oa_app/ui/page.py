@@ -949,7 +949,7 @@ def _request_week_bounds(ss, week_titles_map: dict[str, str | None], seed_title:
     return _week_bounds_la()
 
 
-def _approval_created_week_fallback(req: dict, day_canon: str) -> date | None:
+def _approval_created_at_date(req: dict) -> date | None:
     s = str(req.get("Created", "") or "").strip()
     if not s:
         return None
@@ -957,9 +957,32 @@ def _approval_created_week_fallback(req: dict, day_canon: str) -> date | None:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
-        dt_la = dt.astimezone(ZoneInfo("America/Los_Angeles"))
-        ws, we = _week_bounds_la(dt_la.date())
+        return dt.astimezone(ZoneInfo("America/Los_Angeles")).date()
+    except Exception:
+        return None
+
+
+def _approval_created_week_fallback(req: dict, day_canon: str) -> date | None:
+    created_d = _approval_created_at_date(req)
+    if not created_d:
+        return None
+    try:
+        ws, we = _week_bounds_la(created_d)
         return week_range_mod.date_for_weekday(ws, we, day_canon)
+    except Exception:
+        return None
+
+
+def _approval_meta_week_bounds(meta: dict, *, ref_date: date | None = None) -> tuple[date, date] | None:
+    wk_start = str((meta or {}).get("week_start") or "").strip()
+    wk_end = str((meta or {}).get("week_end") or "").strip()
+    if not (wk_start and wk_end):
+        return None
+    try:
+        return week_range_mod.week_range_from_text(
+            f"{wk_start} - {wk_end}",
+            today=ref_date or _la_today(),
+        )
     except Exception:
         return None
 
@@ -968,7 +991,9 @@ def _approval_row_event_date(ss, req: dict) -> date | None:
     """Best-effort event date for an approval row.
 
     Used to keep validation week math from counting old requests that happen to
-    share the same rolling sheet title.
+    share the same rolling sheet title. For rolling UNH/MC tabs, never project
+    an old approval onto the *current* worksheet week unless the row carries an
+    explicit shift date or week marker.
     """
     details = str(req.get("Details", "") or "")
     meta, details_rest = _extract_details_meta(details)
@@ -992,9 +1017,20 @@ def _approval_row_event_date(ss, req: dict) -> date | None:
         campus_kind_guess = campus_kind(campus_title or campus)
         campus_key = "ONCALL" if campus_kind_guess == "ONCALL" else str(campus_kind_guess or campus).upper()
 
-    if ss is not None and campus_key in {"UNH", "MC"} and campus_title:
+    created_d = _approval_created_at_date(req)
+    ref_date = created_d or _la_today()
+
+    explicit_week = None
+    if campus_title:
         try:
-            d = _date_for_weekday_in_sheet(ss, campus_title, day_canon)
+            explicit_week = week_range_mod.week_range_from_title(campus_title, today=ref_date)
+        except Exception:
+            explicit_week = None
+    if not explicit_week:
+        explicit_week = _approval_meta_week_bounds(meta, ref_date=created_d)
+    if explicit_week:
+        try:
+            d = week_range_mod.date_for_weekday(explicit_week[0], explicit_week[1], day_canon)
             if d:
                 return d
         except Exception:

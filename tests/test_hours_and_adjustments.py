@@ -341,6 +341,74 @@ class ApprovalWorkflowTests(unittest.TestCase):
             )
 
 
+class ApprovalDateResolutionTests(unittest.TestCase):
+    def test_approval_row_event_date_uses_created_week_for_rolling_mc_titles_without_explicit_date(self):
+        req = {
+            "Campus": "MC",
+            "Day": "Thursday",
+            "Created": "2026-04-03T10:00:00-07:00",
+            "Details": 'META={"campus_key":"MC","sheet_title":"MC (OA and GOAs)"} | target=Bajaj Aryaman',
+        }
+
+        with patch.object(page, "_date_for_weekday_in_sheet", side_effect=AssertionError("rolling tabs should not use the current sheet week")):
+            event_d = page._approval_row_event_date(object(), req)
+
+        self.assertEqual(event_d, date(2026, 4, 2))
+
+    def test_append_my_pickups_skips_old_approved_pickups_from_prior_rolling_week(self):
+        base_sched = {"thursday": {"UNH": [], "MC": [], "On-Call": []}}
+        old_pickup = {
+            "Action": "pickup",
+            "Status": "APPROVED",
+            "Requester": "Shepard, Tessa",
+            "Campus": "MC",
+            "Day": "Thursday",
+            "Start": "10:00 AM",
+            "End": "1:00 PM",
+            "Created": "2026-04-03T10:00:00-07:00",
+            "Details": 'META={"campus_key":"MC","sheet_title":"MC (OA and GOAs)"} | target=Bajaj Aryaman',
+        }
+
+        with patch.object(page, "_date_for_weekday_in_sheet", side_effect=AssertionError("rolling tabs should not use the current sheet week")):
+            merged = page._append_my_pickups_into_sched(
+                base_sched,
+                [old_pickup],
+                requester="Shepard, Tessa",
+                week_titles={"MC (OA and GOAs)"},
+                include_statuses={"APPROVED"},
+                ss=object(),
+                week_bounds=(date(2026, 4, 12), date(2026, 4, 18)),
+            )
+
+        self.assertEqual(merged["thursday"]["MC"], [])
+
+    def test_append_my_pickups_keeps_current_week_pickups_with_explicit_date(self):
+        base_sched = {"thursday": {"UNH": [], "MC": [], "On-Call": []}}
+        current_pickup = {
+            "Action": "pickup",
+            "Status": "APPROVED",
+            "Requester": "Shepard, Tessa",
+            "Campus": "MC",
+            "Day": "Thursday",
+            "Start": "10:00 AM",
+            "End": "1:00 PM",
+            "Created": "2026-04-14T10:00:00-07:00",
+            "Details": 'META={"campus_key":"MC","sheet_title":"MC (OA and GOAs)"} | target=Bajaj Aryaman | date=2026-04-16',
+        }
+
+        merged = page._append_my_pickups_into_sched(
+            base_sched,
+            [current_pickup],
+            requester="Shepard, Tessa",
+            week_titles={"MC (OA and GOAs)"},
+            include_statuses={"APPROVED"},
+            ss=object(),
+            week_bounds=(date(2026, 4, 12), date(2026, 4, 18)),
+        )
+
+        self.assertEqual(merged["thursday"]["MC"], [("10:00 AM", "1:00 PM")])
+
+
 class OvertimeBaselineTests(unittest.TestCase):
     def test_overtime_baseline_uses_adjusted_hours_from_approved_changes(self):
         base_sched = {
