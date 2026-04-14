@@ -2512,6 +2512,7 @@ def run() -> None:
                             res = sync_swaps_to_sheets(ss, sb, apply_grid_colors=True)
                             st.session_state["_LAST_SWAP_SYNC_TS"] = now_ts
                             sheet_errs = res.get("sheet_errors") or []
+                            grid_errs = res.get("grid_errors") or []
                             msg = (
                                 f"Synced swaps. Weekly written: {res.get('weekly_written')} • "
                                 f"Future written: {res.get('future_written')} • "
@@ -2519,10 +2520,15 @@ def run() -> None:
                             )
                             if sheet_errs:
                                 msg += f" • Errors: {len(sheet_errs)}"
+                            if grid_errs:
+                                msg += f" • Grid issues: {len(grid_errs)}"
                             st.success(msg)
                             if sheet_errs:
                                 st.caption("First error:")
                                 st.code(str(sheet_errs[0]))
+                            if grid_errs:
+                                st.caption("First grid issue:")
+                                st.code(str(grid_errs[0]))
                         except Exception as e:
                             st.error(f"Swap sync failed: {str(e)}")
 
@@ -2761,8 +2767,11 @@ def run() -> None:
                             apply_grid_colors=True,
                         )
                         sheet_errs = res.get("sheet_errors") or []
+                        grid_errs = res.get("grid_errors") or []
                         if sheet_errs:
                             st.warning(f"Swap section sync had errors. First error: {sheet_errs[0]}")
+                        if grid_errs:
+                            st.warning(f"Swap grid sync had issues. First issue: {grid_errs[0]}")
                     except Exception as e:
                         st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
                 return msg
@@ -2879,8 +2888,11 @@ def run() -> None:
                             apply_grid_colors=True,
                         )
                         sheet_errs = res.get("sheet_errors") or []
+                        grid_errs = res.get("grid_errors") or []
                         if sheet_errs:
                             st.warning(f"Swap section sync had errors. First error: {sheet_errs[0]}")
+                        if grid_errs:
+                            st.warning(f"Swap grid sync had issues. First issue: {grid_errs[0]}")
                     except Exception as e:
                         st.warning(f"Pickup recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
                 return msg
@@ -3772,13 +3784,16 @@ def run() -> None:
                                 except Exception:
                                     ws_obj = None
 
-                                sync_swaps_to_sheets(
+                                res = sync_swaps_to_sheets(
                                     ss,
                                     sb,
                                     worksheet=ws_obj,
                                     sheet_title=active_tab,
                                     apply_grid_colors=True,
                                 )
+                                grid_errs = res.get("grid_errors") or []
+                                if grid_errs:
+                                    st.warning(f"Swap grid sync had issues. First issue: {grid_errs[0]}")
                             except Exception as e:
                                 st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
 
