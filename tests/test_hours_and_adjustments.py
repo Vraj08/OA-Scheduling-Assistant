@@ -492,6 +492,12 @@ class CalloutDateSelectionTests(unittest.TestCase):
 
         self.assertEqual(event_d, date(2026, 4, 14))
 
+    def test_date_matches_day_canon_accepts_matching_weekday(self):
+        self.assertTrue(page._date_matches_day_canon(date(2026, 4, 14), "tuesday"))
+
+    def test_date_matches_day_canon_rejects_wrong_weekday(self):
+        self.assertFalse(page._date_matches_day_canon(date(2026, 4, 16), "tuesday"))
+
 
 class OvertimeBaselineTests(unittest.TestCase):
     def test_overtime_baseline_uses_adjusted_hours_from_approved_changes(self):

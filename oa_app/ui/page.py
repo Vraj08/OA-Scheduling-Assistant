@@ -127,6 +127,14 @@ def _callout_event_date_for_sheet(ss, campus_title: str, day_canon: str) -> date
     return _date_for_weekday_in_current_la_week(day_canon)
 
 
+def _date_matches_day_canon(d: date | None, day_canon: str) -> bool:
+    if not isinstance(d, date):
+        return False
+    want = utils.normalize_day(day_canon)
+    got = utils.normalize_day(d.strftime("%A"))
+    return bool(want and got and want == got)
+
+
 _DETAIL_KV_RE = re.compile(r"\b([a-z_]+)\s*=\s*([^|]+)", flags=re.I)
 
 
@@ -3702,12 +3710,27 @@ def run() -> None:
 
                 # UNH/MC callouts: allow specifying the calendar date (used for logs/DB).
                 event_date = None
+                event_date_valid = True
                 if kind in {"UNH", "MC"}:
-                    event_date = _callout_event_date_for_sheet(ss, active_tab, day_canon)
-                    if event_date:
-                        st.caption(f"Date of shift: {event_date.isoformat()} (from selected day)")
-                    else:
+                    default_d = _callout_event_date_for_sheet(ss, active_tab, day_canon)
+                    if not default_d:
                         st.warning("Could not derive the shift date from the selected day.")
+                        event_date_valid = False
+                    else:
+                        date_key = f"callout.date.{active_tab}.{day_canon}"
+                        event_date = st.date_input(
+                            "Date of shift",
+                            value=default_d,
+                            key=date_key,
+                        )
+                        if not _date_matches_day_canon(event_date, day_canon):
+                            picked_day = event_date.strftime("%A") if isinstance(event_date, date) else "that day"
+                            st.error(
+                                f"Selected date is {picked_day}. Please choose a {day_canon.title()} date."
+                            )
+                            event_date_valid = False
+                        else:
+                            st.caption(f"Selected date: {event_date.isoformat()} ({day_canon.title()})")
 
                 reason_opt = st.selectbox(
                     "Reason",
@@ -3721,7 +3744,8 @@ def run() -> None:
                     reason = f"other:{other_txt.strip()}" if other_txt.strip() else "other"
 
                 # Per policy: callouts proceed directly and are always logged as "no cover".
-                if st.button("Apply Call-Out"):
+                can_apply_callout = bool(kind == "ONCALL" or event_date_valid)
+                if st.button("Apply Call-Out", disabled=not can_apply_callout):
                     try:
                         # Derive event date
                         campus_key = ("ONCALL" if kind == "ONCALL" else kind)
