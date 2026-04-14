@@ -477,6 +477,22 @@ class ApprovalDateResolutionTests(unittest.TestCase):
         self.assertEqual(merged["thursday"]["MC"], [("10:00 AM", "1:00 PM")])
 
 
+class CalloutDateSelectionTests(unittest.TestCase):
+    def test_callout_event_date_for_sheet_prefers_inferred_sheet_week_date(self):
+        with patch.object(page, "_date_for_weekday_in_sheet", return_value=date(2026, 4, 16)):
+            event_d = page._callout_event_date_for_sheet(object(), "MC (OA and GOAs)", "thursday")
+
+        self.assertEqual(event_d, date(2026, 4, 16))
+
+    def test_callout_event_date_for_sheet_falls_back_to_matching_day_not_week_start(self):
+        with patch.object(page, "_date_for_weekday_in_sheet", return_value=None), patch.object(
+            page, "_week_bounds_la", return_value=(date(2026, 4, 12), date(2026, 4, 18))
+        ):
+            event_d = page._callout_event_date_for_sheet(object(), "MC (OA and GOAs)", "tuesday")
+
+        self.assertEqual(event_d, date(2026, 4, 14))
+
+
 class OvertimeBaselineTests(unittest.TestCase):
     def test_overtime_baseline_uses_adjusted_hours_from_approved_changes(self):
         base_sched = {

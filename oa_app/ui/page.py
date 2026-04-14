@@ -114,6 +114,19 @@ def _date_for_weekday_in_sheet(ss, campus_title: str, day_canon: str) -> date | 
     return week_range_mod.date_for_weekday(ws, we, day_canon)
 
 
+def _date_for_weekday_in_current_la_week(day_canon: str, *, ref: date | None = None) -> date | None:
+    ws, we = _week_bounds_la(ref)
+    return week_range_mod.date_for_weekday(ws, we, day_canon)
+
+
+def _callout_event_date_for_sheet(ss, campus_title: str, day_canon: str) -> date | None:
+    """Best-effort callout event date that stays aligned with the selected day."""
+    d = _date_for_weekday_in_sheet(ss, campus_title, day_canon)
+    if d:
+        return d
+    return _date_for_weekday_in_current_la_week(day_canon)
+
+
 _DETAIL_KV_RE = re.compile(r"\b([a-z_]+)\s*=\s*([^|]+)", flags=re.I)
 
 
@@ -3690,11 +3703,11 @@ def run() -> None:
                 # UNH/MC callouts: allow specifying the calendar date (used for logs/DB).
                 event_date = None
                 if kind in {"UNH", "MC"}:
-                    default_d = _date_for_weekday_in_sheet(ss, active_tab, day_canon)
-                    if not default_d:
-                        ws, _we = _week_bounds_la()
-                        default_d = ws
-                    event_date = st.date_input("Date of shift", value=default_d, key="callout.date")
+                    event_date = _callout_event_date_for_sheet(ss, active_tab, day_canon)
+                    if event_date:
+                        st.caption(f"Date of shift: {event_date.isoformat()} (from selected day)")
+                    else:
+                        st.warning("Could not derive the shift date from the selected day.")
 
                 reason_opt = st.selectbox(
                     "Reason",
@@ -3714,7 +3727,7 @@ def run() -> None:
                         campus_key = ("ONCALL" if kind == "ONCALL" else kind)
                         if kind in {"UNH", "MC"}:
                             if not event_date:
-                                raise ValueError("Callout missing date. Please select a date for UNH/MC callouts.")
+                                raise ValueError("Callout missing date. Could not derive a date for the selected day.")
                             event_d = event_date
                         else:
                             event_d = _oncall_event_date(active_tab, day_canon)
