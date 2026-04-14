@@ -3,6 +3,7 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from oa_app.core import utils
 from oa_app.services import approvals, callouts_db, pickups_db
 from oa_app.jobs import sync_swaps_to_sheets
 from oa_app.ui import page, schedule_query, ui_peek
@@ -393,6 +394,25 @@ class OvertimeBaselineTests(unittest.TestCase):
 
         self.assertEqual(week_mins, 240)
         self.assertEqual(per_day["monday"], 240)
+
+
+class CampusNormalizationTests(unittest.TestCase):
+    def test_oncall_titles_normalize_to_oncall_for_future_approvals(self):
+        campus_key = utils.normalize_campus("On Call 4/19 - 4/25", "MC")
+
+        self.assertEqual(campus_key, "ONCALL")
+        self.assertTrue(
+            page._should_color_schedule_now(
+                campus_key=campus_key,
+                event_d=date(2026, 4, 19),
+            )
+        )
+
+    def test_missing_campus_uses_oncall_default_title(self):
+        self.assertEqual(
+            utils.normalize_campus("", "On Call 4/19 - 4/25"),
+            "ONCALL",
+        )
 
 
 class RequestDetailsDisplayTests(unittest.TestCase):

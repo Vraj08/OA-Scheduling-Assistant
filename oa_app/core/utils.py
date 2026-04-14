@@ -75,14 +75,17 @@ def name_key(name: str) -> str:
 
 
 def normalize_campus(campus: str | None, default_campus: str) -> str:
-    if not campus:
-        return default_campus.split()[0]
-    c = campus.strip().lower()
+    raw = str(campus or default_campus or "").strip()
+    if not raw:
+        return ""
+    c = raw.lower()
     if c.startswith("unh"):
         return "UNH"
     if c.startswith("mc") or "main" in c:
         return "MC"
-    return campus.split()[0].upper()
+    if c.startswith("oncall") or re.search(r"\bon\s*[- ]?\s*call\b", c):
+        return "ONCALL"
+    return raw.split()[0].upper()
 
 
 def clean_dash(text: str) -> str:
