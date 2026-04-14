@@ -581,10 +581,9 @@ def _lane_coords_for_day(
             r_label = label_rows[i]
             r_next = label_rows[i + 1]
             for rr in range(r_label + 1, r_next):
-                if rr >= len(grid) or day_col >= len(grid[rr]):
+                if rr >= len(grid):
                     continue
-                if str(grid[rr][day_col] or "").strip():
-                    coords.append((rr, day_col))
+                coords.append((rr, day_col))
         return coords
 
     time_rows: list[int] = []
@@ -599,10 +598,9 @@ def _lane_coords_for_day(
         r0 = time_rows[i]
         r1 = time_rows[i + 1]
         for rr in range(r0 + 1, r1):
-            if rr >= len(grid) or day_col >= len(grid[rr]):
+            if rr >= len(grid):
                 continue
-            if str(grid[rr][day_col] or "").strip():
-                coords.append((rr, day_col))
+            coords.append((rr, day_col))
     return coords
 
 

@@ -698,6 +698,38 @@ class SyncGridReconcileTests(unittest.TestCase):
         self.assertIn((2, 3, sync_swaps_to_sheets.RED), painted)
         self.assertIn((4, 3, sync_swaps_to_sheets.RED), painted)
 
+    def test_apply_grid_colors_clears_stale_past_blank_colored_cells(self):
+        grid = [
+            ["Time", "Monday"],
+            ["7:00 AM", ""],
+            ["", ""],
+        ]
+        bg_grid = [
+            [None, None],
+            [None, None],
+            [None, sync_swaps_to_sheets.RED],
+        ]
+        ws = _FakeGridWorksheet(title="MC (OA and GOAs)", grid=grid, bg_grid=bg_grid)
+
+        with patch.object(sync_swaps_to_sheets, "bump_ws_version"):
+            errs = sync_swaps_to_sheets._apply_grid_colors(
+                ws,
+                callouts=[],
+                pickups=[],
+                today=date(2026, 4, 14),
+            )
+
+        self.assertEqual(errs, [])
+        painted = []
+        for body in ws.spreadsheet.batch_requests:
+            for req in body.get("requests", []):
+                rep = req.get("repeatCell", {})
+                rng = rep.get("range", {})
+                color = (((rep.get("cell") or {}).get("userEnteredFormat") or {}).get("backgroundColor") or {})
+                painted.append((rng.get("startRowIndex"), rng.get("startColumnIndex"), color))
+
+        self.assertIn((2, 1, sync_swaps_to_sheets.WHITE), painted)
+
     def test_sync_swaps_manual_multi_sheet_sync_runs_grid_reconcile_for_each_target(self):
         ws_mc = _FakeGridWorksheet(title="MC (OA and GOAs)", grid=[[""]], bg_grid=[[None]], sheet_id=1)
         ws_oncall = _FakeGridWorksheet(title="On Call 4/12 - 4/18", grid=[[""]], bg_grid=[[None]], sheet_id=2)
