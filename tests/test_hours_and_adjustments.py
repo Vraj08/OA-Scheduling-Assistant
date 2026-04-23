@@ -1,5 +1,5 @@
 import unittest
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -171,6 +171,186 @@ class ScheduleQueryHoursTests(unittest.TestCase):
         )
 
         self.assertLess(rendered.index("### Sunday"), rendered.index("### Monday"))
+
+
+class WorkingNowTests(unittest.TestCase):
+    def test_should_show_oncall_now_switches_by_weekday_and_weekend_rules(self):
+        self.assertFalse(schedule_query.should_show_oncall_now(datetime(2026, 4, 16, 18, 59)))
+        self.assertTrue(schedule_query.should_show_oncall_now(datetime(2026, 4, 16, 19, 0)))
+        self.assertTrue(schedule_query.should_show_oncall_now(datetime(2026, 4, 18, 10, 0)))
+
+    def test_working_entries_for_day_handles_oncall_windows_that_end_at_midnight(self):
+        entries = schedule_query._working_entries_for_day(
+            [{"name": "Alex Smith", "role": "OA", "start": "7:00 PM", "end": "12:00 AM"}],
+            source="On-Call",
+            when=datetime(2026, 4, 14, 22, 15),
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["name"], "Alex Smith")
+
+    def test_unh_mc_people_ranges_merge_consecutive_half_hours_per_person(self):
+        grid = [
+            ["Schedule", ""],
+            ["Time", "Monday"],
+            ["7:00 AM", ""],
+            ["", "OA: Alex Smith"],
+            ["7:30 AM", ""],
+            ["", "OA: Alex Smith"],
+            ["8:00 AM", ""],
+        ]
+        ws = SimpleNamespace(title="UNH (OA and GOAs)")
+
+        with patch.object(schedule_query, "_read_grid", return_value=grid):
+            rows = schedule_query._unh_mc_people_ranges(ws)
+
+        start = schedule_query._fmt(schedule_query._parse_time_cell("7:00 AM"))
+        end = schedule_query._fmt(schedule_query._parse_time_cell("8:00 AM"))
+        self.assertEqual(
+            rows["monday"],
+            [{"name": "Alex Smith", "role": "OA", "start": start, "end": end}],
+        )
+
+    def test_oncall_people_ranges_capture_roles_from_block_rows(self):
+        grid = [
+            ["", "Sunday 4 / 12"],
+            ["", "11:00 AM - 3:00 PM"],
+            ["", "GOA: Mary Tekele"],
+            ["", "OA: Alex Smith"],
+        ]
+        ws = SimpleNamespace(title="On Call 4/12/2026 - 4/18/2026")
+
+        with patch.object(schedule_query, "_read_grid", return_value=grid):
+            rows = schedule_query._oncall_people_ranges(ws)
+
+        start = schedule_query._fmt(schedule_query._parse_time_cell("11:00 AM"))
+        end = schedule_query._fmt(schedule_query._parse_time_cell("3:00 PM"))
+        self.assertEqual(
+            rows["sunday"],
+            [
+                {"name": "Alex Smith", "role": "OA", "start": start, "end": end},
+                {"name": "Mary Tekele", "role": "GOA", "start": start, "end": end},
+            ],
+        )
+
+    def test_get_people_working_now_uses_campus_during_weekday_daytime(self):
+        class _FakeSheetLookup:
+            def worksheet(self, title):
+                return SimpleNamespace(title=title)
+
+        def fake_people(ws):
+            if ws.title == "UNH":
+                return {"thursday": [{"name": "Alex Smith", "role": "OA", "start": "1:00 PM", "end": "3:00 PM"}]}
+            return {"thursday": [{"name": "Jamie Doe", "role": "GOA", "start": "12:00 PM", "end": "2:00 PM"}]}
+
+        with patch.object(schedule_query, "_open_three", return_value=["UNH", "MC", "On Call 4/12 - 4/18"]), patch.object(
+            schedule_query, "_unh_mc_people_ranges", side_effect=fake_people
+        ):
+            snapshot = schedule_query.get_people_working_now(
+                _FakeSheetLookup(),
+                when=datetime(2026, 4, 16, 13, 15),
+            )
+
+        self.assertEqual(snapshot["display_mode"], "campus")
+        self.assertEqual(snapshot["sources"], ["UNH", "MC"])
+        self.assertEqual(
+            [(row["source"], row["name"]) for row in snapshot["entries"]],
+            [("UNH", "Alex Smith"), ("MC", "Jamie Doe")],
+        )
+
+    def test_get_people_working_now_uses_oncall_after_7pm_weekday(self):
+        class _FakeSheetLookup:
+            def worksheet(self, title):
+                return SimpleNamespace(title=title)
+
+        with patch.object(schedule_query, "_open_three", return_value=["UNH", "MC", "On Call 4/12 - 4/18"]), patch.object(
+            schedule_query,
+            "_oncall_people_ranges",
+            return_value={"thursday": [{"name": "Night OA", "role": "OA", "start": "7:00 PM", "end": "12:00 AM"}]},
+        ):
+            snapshot = schedule_query.get_people_working_now(
+                _FakeSheetLookup(),
+                when=datetime(2026, 4, 16, 20, 0),
+            )
+
+        self.assertEqual(snapshot["display_mode"], "oncall")
+        self.assertEqual(snapshot["sources"], ["On-Call"])
+        self.assertEqual([(row["source"], row["name"]) for row in snapshot["entries"]], [("On-Call", "Night OA")])
+
+    def test_annotate_working_now_snapshot_marks_active_callout_as_no_cover(self):
+        snapshot = {
+            "entries": [
+                {
+                    "source": "MC",
+                    "name": "Alex Smith",
+                    "role": "OA",
+                    "start": "7:00 PM",
+                    "end": "12:00 AM",
+                }
+            ]
+        }
+        callouts = [
+            {
+                "campus": "MC",
+                "caller_name": "Alex Smith",
+                "shift_start_at": "2026-04-16T19:00:00-07:00",
+                "shift_end_at": "2026-04-17T00:00:00-07:00",
+            }
+        ]
+
+        annotated = page._annotate_working_now_snapshot(
+            snapshot,
+            when=datetime(2026, 4, 16, 20, 0),
+            callouts_rows=callouts,
+            pickups_rows=[],
+        )
+
+        row = annotated["entries"][0]
+        self.assertEqual(row["display_name"], "Alex Smith")
+        self.assertEqual(row["status"], "No cover")
+        self.assertEqual(row["status_kind"], "no_cover")
+
+    def test_annotate_working_now_snapshot_shows_coverer_for_active_pickup(self):
+        snapshot = {
+            "entries": [
+                {
+                    "source": "UNH",
+                    "name": "Taylor Jones",
+                    "role": "GOA",
+                    "start": "1:00 PM",
+                    "end": "3:00 PM",
+                }
+            ]
+        }
+        callouts = [
+            {
+                "campus": "UNH",
+                "caller_name": "Taylor Jones",
+                "shift_start_at": "2026-04-16T13:00:00-07:00",
+                "shift_end_at": "2026-04-16T15:00:00-07:00",
+            }
+        ]
+        pickups = [
+            {
+                "campus": "UNH",
+                "target_name": "Taylor Jones",
+                "picker_name": "Jamie Doe",
+                "shift_start_at": "2026-04-16T13:00:00-07:00",
+                "shift_end_at": "2026-04-16T15:00:00-07:00",
+            }
+        ]
+
+        annotated = page._annotate_working_now_snapshot(
+            snapshot,
+            when=datetime(2026, 4, 16, 13, 30),
+            callouts_rows=callouts,
+            pickups_rows=pickups,
+        )
+
+        row = annotated["entries"][0]
+        self.assertEqual(row["display_name"], "Jamie Doe")
+        self.assertEqual(row["status"], "Covering Taylor Jones")
+        self.assertEqual(row["status_kind"], "covered")
 
 
 class AdjustmentDurationTests(unittest.TestCase):

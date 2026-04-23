@@ -628,6 +628,41 @@ def cached_schedule_df(schedule_dict: dict, epoch):
     return schedule_query.build_schedule_dataframe(schedule_dict)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_people_working_now(ss_id: str, epoch, when_key: str):
+    ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
+    if not ss:
+        return {}
+    try:
+        when = datetime.fromisoformat(str(when_key))
+    except Exception:
+        when = None
+    snapshot = schedule_query.get_people_working_now(ss, when=when) or {}
+    return _annotate_working_now_snapshot(snapshot, when=when) or snapshot
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_working_now_coverage_rows(week_start: str, week_end: str) -> dict:
+    try:
+        ws = date.fromisoformat(str(week_start))
+        we = date.fromisoformat(str(week_end))
+    except Exception:
+        ws, we = _week_bounds_la()
+
+    out = {"callouts": [], "pickups": []}
+    try:
+        if callouts_db.supabase_callouts_enabled():
+            out["callouts"] = callouts_db.list_callouts_in_range(week_start=ws, week_end=we) or []
+    except Exception:
+        out["callouts"] = []
+    try:
+        if pickups_db.supabase_pickups_enabled():
+            out["pickups"] = pickups_db.list_pickups_in_range(week_start=ws, week_end=we) or []
+    except Exception:
+        out["pickups"] = []
+    return out
+
+
 @st.cache_data(ttl=5, show_spinner=False)
 def cached_approval_table(ss_id: str, approvals_epoch: int, max_rows: int = 500):
     """Read approval requests with a short cache.
@@ -656,6 +691,232 @@ def _format_pair_12h(s24: str, e24: str) -> str:
     sdt = datetime.strptime(s24, "%H:%M")
     edt = datetime.strptime(e24, "%H:%M")
     return f"{fmt_time(sdt)} – {fmt_time(edt)}"
+
+
+def _coerce_la_datetime(when: datetime | None = None) -> datetime:
+    if when is None:
+        return datetime.now(ZoneInfo("America/Los_Angeles"))
+    if when.tzinfo is None:
+        return when.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+    return when.astimezone(ZoneInfo("America/Los_Angeles"))
+
+
+def _parse_iso_datetime_la(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+    return dt.astimezone(ZoneInfo("America/Los_Angeles"))
+
+
+def _interval_contains_moment(start_at: datetime, end_at: datetime, moment: datetime) -> bool:
+    end_norm = end_at if end_at > start_at else end_at + timedelta(days=1)
+    return bool(start_at <= moment < end_norm)
+
+
+def _intervals_overlap(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime) -> bool:
+    end_a_norm = end_a if end_a > start_a else end_a + timedelta(days=1)
+    end_b_norm = end_b if end_b > start_b else end_b + timedelta(days=1)
+    return bool(start_a < end_b_norm and start_b < end_a_norm)
+
+
+def _working_now_entry_window(entry: dict, when: datetime) -> tuple[datetime, datetime] | None:
+    start_txt = str(entry.get("start") or "").strip()
+    end_txt = str(entry.get("end") or "").strip()
+    start_dt = schedule_query._parse_time_cell(start_txt)
+    end_dt = schedule_query._parse_time_cell(end_txt)
+    if not (start_dt and end_dt):
+        return None
+
+    local_when = _coerce_la_datetime(when)
+    start_at = datetime(
+        local_when.year,
+        local_when.month,
+        local_when.day,
+        start_dt.hour,
+        start_dt.minute,
+        tzinfo=ZoneInfo("America/Los_Angeles"),
+    )
+    end_at = datetime(
+        local_when.year,
+        local_when.month,
+        local_when.day,
+        end_dt.hour,
+        end_dt.minute,
+        tzinfo=ZoneInfo("America/Los_Angeles"),
+    )
+    if end_at <= start_at:
+        end_at = end_at + timedelta(days=1)
+    return start_at, end_at
+
+
+def _coverage_campus_key(source_or_campus: str) -> str:
+    return utils.normalize_campus(source_or_campus, source_or_campus)
+
+
+def _dedupe_display_names(names: list[str]) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for raw in names or []:
+        name = str(raw or "").strip()
+        nk = name_key(name)
+        if not name or nk in seen:
+            continue
+        seen.add(nk)
+        out.append(name)
+    return out
+
+
+def _annotate_working_now_snapshot(
+    snapshot: dict,
+    *,
+    when: datetime | None = None,
+    callouts_rows: list[dict] | None = None,
+    pickups_rows: list[dict] | None = None,
+) -> dict:
+    local_when = _coerce_la_datetime(when)
+    ws, we = _week_bounds_la(local_when.date())
+
+    if callouts_rows is None or pickups_rows is None:
+        coverage = _cached_working_now_coverage_rows(ws.isoformat(), we.isoformat()) or {}
+        if callouts_rows is None:
+            callouts_rows = list(coverage.get("callouts") or [])
+        if pickups_rows is None:
+            pickups_rows = list(coverage.get("pickups") or [])
+
+    active_callouts: dict[tuple[str, str], list[dict]] = {}
+    for row in callouts_rows or []:
+        start_at = _parse_iso_datetime_la(row.get("shift_start_at"))
+        end_at = _parse_iso_datetime_la(row.get("shift_end_at"))
+        if not (start_at and end_at):
+            continue
+        if not _interval_contains_moment(start_at, end_at, local_when):
+            continue
+        campus_key = _coverage_campus_key(str(row.get("campus") or ""))
+        caller_key = name_key(str(row.get("caller_name") or ""))
+        if not (campus_key and caller_key):
+            continue
+        active_callouts.setdefault((campus_key, caller_key), []).append(dict(row))
+
+    active_pickups: dict[tuple[str, str], list[dict]] = {}
+    for row in pickups_rows or []:
+        start_at = _parse_iso_datetime_la(row.get("shift_start_at"))
+        end_at = _parse_iso_datetime_la(row.get("shift_end_at"))
+        if not (start_at and end_at):
+            continue
+        if not _interval_contains_moment(start_at, end_at, local_when):
+            continue
+        campus_key = _coverage_campus_key(str(row.get("campus") or ""))
+        target_key = name_key(str(row.get("target_name") or ""))
+        if not (campus_key and target_key):
+            continue
+        active_pickups.setdefault((campus_key, target_key), []).append(dict(row))
+
+    out = dict(snapshot or {})
+    annotated_entries: list[dict] = []
+    for entry in list(snapshot.get("entries") or []):
+        row = dict(entry)
+        source = str(row.get("source") or "")
+        original_name = str(row.get("name") or "").strip()
+        campus_key = _coverage_campus_key(source)
+        target_key = name_key(original_name)
+        row["display_name"] = original_name
+        row["display_role"] = str(row.get("role") or "").strip()
+        row["status"] = "Scheduled"
+        row["status_kind"] = "scheduled"
+
+        entry_window = _working_now_entry_window(row, local_when)
+        callouts = list(active_callouts.get((campus_key, target_key), []))
+        pickups = list(active_pickups.get((campus_key, target_key), []))
+        if entry_window:
+            start_at, end_at = entry_window
+            callouts = [
+                c for c in callouts
+                if _intervals_overlap(
+                    start_at,
+                    end_at,
+                    _parse_iso_datetime_la(c.get("shift_start_at")) or start_at,
+                    _parse_iso_datetime_la(c.get("shift_end_at")) or end_at,
+                )
+            ]
+            pickups = [
+                p for p in pickups
+                if _intervals_overlap(
+                    start_at,
+                    end_at,
+                    _parse_iso_datetime_la(p.get("shift_start_at")) or start_at,
+                    _parse_iso_datetime_la(p.get("shift_end_at")) or end_at,
+                )
+            ]
+
+        if pickups:
+            coverers = _dedupe_display_names([str(p.get("picker_name") or "").strip() for p in pickups])
+            if coverers:
+                row["display_name"] = ", ".join(coverers)
+                row["display_role"] = ""
+                row["status"] = f"Covering {original_name}"
+                row["status_kind"] = "covered"
+                row["covered_by"] = coverers
+        elif callouts:
+            row["status"] = "No cover"
+            row["status_kind"] = "no_cover"
+
+        annotated_entries.append(row)
+
+    out["entries"] = annotated_entries
+    return out
+
+
+def _render_people_working_now_panel(ss, epoch_key) -> None:
+    now_la = datetime.now(ZoneInfo("America/Los_Angeles"))
+    when_key = now_la.strftime("%Y-%m-%dT%H:%M")
+    snapshot = cached_people_working_now(ss.id, epoch_key, when_key) or {}
+
+    display_mode = str(snapshot.get("display_mode") or "campus")
+    sources = list(snapshot.get("sources") or ([] if display_mode == "oncall" else ["UNH", "MC"]))
+    entries = list(snapshot.get("entries") or [])
+
+    grouped: dict[str, list[dict]] = {src: [] for src in sources}
+    for row in entries:
+        grouped.setdefault(str(row.get("source") or "Unknown"), []).append(row)
+
+    mode_label = "On-Call" if display_mode == "oncall" else "UNH + MC"
+    with st.expander("Who's Working Now", expanded=True):
+        st.caption(f"{snapshot.get('when_label', when_key)} (Los Angeles). Showing {mode_label} coverage.")
+        st.caption("Saturday/Sunday uses On-Call. Monday-Friday switches to On-Call from 7:00 PM to 12:00 AM. Red means No cover; orange shows who is covering.")
+
+        if not sources:
+            st.info("No schedule sources are available right now.")
+            return
+
+        cols = st.columns(len(sources))
+        for idx, source in enumerate(sources):
+            with cols[idx]:
+                st.markdown(f"**{source}**")
+                rows = grouped.get(source, [])
+                if not rows:
+                    st.caption("No one is on shift right now.")
+                    continue
+
+                table = []
+                for row in rows:
+                    person = str(row.get("display_name") or row.get("name") or "").strip()
+                    role = str(row.get("display_role") or row.get("role") or "").strip()
+                    if role:
+                        person = f"{person} ({role})"
+                    table.append(
+                        {
+                            "Person": person,
+                            "Shift": f"{row.get('start', '')} - {row.get('end', '')}",
+                            "Status": str(row.get("status") or ""),
+                        }
+                    )
+                st.dataframe(table, hide_index=True, use_container_width=True)
 
 
 def _iter_pairs(seq):
@@ -2451,6 +2712,7 @@ def run() -> None:
     # Always show the Pickup Tradeboard first (no-cover red callouts).
     # This is intentionally rendered even before the user types their name.
     _render_pickup_tradeboard(ss, schedule_global, canon_name)
+    _render_people_working_now_panel(ss, epoch_key)
 
     # Global availability is useful but expensive; make it opt-in.
     # Render it *after* the pickup tradeboard so the pickup view is always first.

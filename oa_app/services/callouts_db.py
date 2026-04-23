@@ -89,27 +89,37 @@ def _late_notice_rule(row: dict[str, Any]) -> str | None:
     return None
 
 
-def list_callouts_for_week(*, caller_name: str, week_start: date, week_end: date) -> list[dict[str, Any]]:
-    """Return current-week callout rows for one caller (best-effort)."""
+def list_callouts_in_range(*, week_start: date, week_end: date) -> list[dict[str, Any]]:
+    """Return callout rows within [week_start, week_end] (inclusive)."""
     if not supabase_callouts_enabled():
         return []
     sb = get_supabase()
-    caller = (caller_name or "").strip()
     resp = with_retry(
         lambda: sb.table("callouts")
-        .select("event_date,duration_hours,caller_name,shift_start_at,shift_end_at")
+        .select("event_date,duration_hours,caller_name,campus,reason,shift_start_at,shift_end_at,submitted_at")
         .gte("event_date", str(week_start))
         .lte("event_date", str(week_end))
         .execute()
     )
     rows: list[dict[str, Any]] = getattr(resp, "data", None) or []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row = dict(r)
+        row["duration_hours"] = _coerce_duration_hours(row)
+        out.append(row)
+    return out
+
+
+def list_callouts_for_week(*, caller_name: str, week_start: date, week_end: date) -> list[dict[str, Any]]:
+    """Return current-week callout rows for one caller (best-effort)."""
+    caller = (caller_name or "").strip()
+    rows = list_callouts_in_range(week_start=week_start, week_end=week_end)
     target_k = name_key(caller)
     out: list[dict[str, Any]] = []
     for r in rows:
         if name_key(str(r.get("caller_name", ""))) != target_k:
             continue
         row = dict(r)
-        row["duration_hours"] = _coerce_duration_hours(row)
         out.append(row)
     return out
 
